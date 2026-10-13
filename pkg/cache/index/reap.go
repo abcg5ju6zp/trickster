@@ -71,6 +71,14 @@ func (idx *IndexedClient) reap() {
 }
 
 func (idx *IndexedClient) reapAt(now int64) {
+	if !idx.confirmed.Load() {
+		// an index that cannot yet vouch for the cache evicts nothing: its totals may omit
+		// objects a sweep has still to find, and what it lists may carry stale facts. The
+		// pressure that hastened the pass is left set, so the first confirmed pass answers it
+		logger.Debug("cache reap deferred until the index is confirmed",
+			logging.Pairs{"cacheName": idx.name})
+		return
+	}
 	idx.pressure.Store(false)
 	// whatever is written from here on is not what this pass chooses to remove
 	since := time.Now()

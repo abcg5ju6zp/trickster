@@ -119,6 +119,26 @@ func (s *shard) update(o *Object, size, expiration, now int64) (int64, bool) {
 	return delta, true
 }
 
+// applies facts found on the cache medium when they describe a later write than the index
+// holds; a sweep observes, but does not access, so the last access time is left as it was.
+// It returns the size delta to count, and whether the cache's facts were the newer ones
+func (s *shard) adoptFacts(o *Object, size, expiration, lastWrite int64) (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if o.removed || o.lastWrite.Load() >= lastWrite {
+		return 0, false
+	}
+	delta := size - o.size.Swap(size)
+	o.evicting.Store(false)
+	o.expiration.Store(expiration)
+	o.lastWrite.Store(lastWrite)
+	if !o.counted {
+		delta = 0
+	}
+	s.schedule(o, expiration, lastWrite)
+	return delta, true
+}
+
 // returns the size that was counted for the object
 func (s *shard) remove(o *Object) int64 {
 	s.mu.Lock()

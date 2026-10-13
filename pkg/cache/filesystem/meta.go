@@ -55,14 +55,40 @@ func (w *metaWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// Close renames what was written onto the file it is for, unless any of it failed to write
+// fsyncs the directory a renamed or unlinked entry lives in, so the entry's new state is
+// durable after a crash of the machine, not merely reordered into it by the kernel
+func syncDir(path string) error {
+	// #nosec G304 -- the path is the configured cache path and a validated meta directory
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// Close syncs what was written, renames it onto the file it is for unless any of it failed
+// to write, and syncs the directory so the replacement itself is durable
 func (w *metaWriter) Close() error {
+	if w.err == nil {
+		if err := w.File.Sync(); err != nil {
+			w.err = err
+		}
+	}
 	err := w.File.Close()
 	if w.err != nil {
 		err = w.err
 	}
 	if err == nil {
 		err = os.Rename(w.temp, w.path)
+	}
+	if err == nil {
+		if serr := syncDir(w.path); serr != nil {
+			err = serr
+		}
 	}
 	if err != nil {
 		os.Remove(w.temp)
@@ -85,7 +111,8 @@ func (s *Store) CreateMeta(name string) (io.WriteCloser, error) {
 	return &metaWriter{File: f, temp: temp, path: path}, nil
 }
 
-// AppendMeta adds p to the end of the named metadata file
+// AppendMeta adds p to the end of the named metadata file, and syncs it before the call
+// returns, so records the index was told were persisted cannot be reordered away by a crash
 func (s *Store) AppendMeta(name string, p []byte) error {
 	path, err := s.metaPath(name)
 	if err != nil {
@@ -102,7 +129,9 @@ func (s *Store) AppendMeta(name string, p []byte) error {
 	if err != nil {
 		return err
 	}
-	_, err = f.Write(p)
+	if _, err = f.Write(p); err == nil {
+		err = f.Sync()
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}

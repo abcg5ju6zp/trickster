@@ -312,7 +312,13 @@ func TestRemoveFailure(t *testing.T) {
 	require.NoError(t, idx.Store("k", []byte("value"), time.Nanosecond))
 	time.Sleep(time.Millisecond)
 	idx.reapAt(time.Now().Add(time.Minute).UnixNano())
+	// the reap's delete failed, so the object stays counted, listed, and eligible to retry
+	requireTotals(t, idx, 1, 5)
+	require.Contains(t, mc.data, "k")
+	mc.removeErr = nil
+	idx.reapAt(time.Now().Add(time.Minute).UnixNano())
 	requireTotals(t, idx, 0, 0)
+	require.NotContains(t, mc.data, "k")
 }
 
 func TestUpdateOptions(t *testing.T) {

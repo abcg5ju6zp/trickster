@@ -68,6 +68,9 @@ const (
 var (
 	recordTable      = crc32.MakeTable(crc32.Castagnoli)
 	errCorruptRecord = errors.New("corrupt index record")
+	// errDamagedIndex is returned when no snapshot of a persisted index can be read whole,
+	// so nothing it held is to be trusted and the cache must be swept anew
+	errDamagedIndex = errors.New("persisted cache index is damaged")
 )
 
 type record struct {
@@ -161,6 +164,10 @@ func generationOf(name, prefix string) (uint64, bool) {
 type journal struct {
 	store blob.MetaStore
 
+	// opMu serializes flush and compact publication runs, so a close that has given up
+	// waiting on a stopped worker can never interleave its own writes with the worker's
+	opMu sync.Mutex
+
 	// mu guards the records waiting to be flushed and the generation they are bound for
 	mu         sync.Mutex
 	pending    []byte
@@ -169,7 +176,7 @@ type journal struct {
 	// lossy marks a journal that is missing records, and so must be replaced by a snapshot
 	lossy bool
 
-	// the rest are the flusher's alone
+	// the rest are the flusher's alone, apart from opMu
 	journalBytes  int64
 	snapshotBytes int64
 }
@@ -232,16 +239,24 @@ func (j *journal) markLossy() {
 	j.mu.Unlock()
 }
 
-// reports whether the journal has grown enough, or lost enough, to be replaced by a snapshot
+// reports whether the journal has grown enough, or lost enough, to be replaced by a snapshot.
+//
+// The records and their mark land as one append, so an observer either sees every one of
+// them with the mark that closes them, or sees none past the last whole record. A response
+// that fails is taken to mean the append may have landed torn or whole, so what it held is
+// not to be relied on and a snapshot is called for.
 func (j *journal) flush(now time.Time) (bool, error) {
+	j.opMu.Lock()
+	defer j.opMu.Unlock()
 	pending, generation, lossy := j.take(false)
 	var err error
 	if len(pending) > 0 {
 		pending = appendMark(pending, now)
-		if err = j.store.AppendMeta(generationName(journalPrefix, generation), pending); err != nil {
+		if err = j.store.AppendMeta(generationName(journalPrefix, generation), pending); err == nil {
+			j.journalBytes += int64(len(pending))
+		} else {
 			lossy = true
 		}
-		j.journalBytes += int64(len(pending))
 	}
 	j.recycle(pending)
 	if lossy {
@@ -251,8 +266,12 @@ func (j *journal) flush(now time.Time) (bool, error) {
 }
 
 // a snapshot of the objects each yields, in a new generation, after which the generations
-// before are removed
+// before are removed. Publication is ordered: the snapshot first, whole and under its final
+// name, and only then the generations it supersedes, whose removal failing changes nothing
+// the snapshot does not already establish
 func (j *journal) compact(now time.Time, each func(yield func(o *Object) bool)) error {
+	j.opMu.Lock()
+	defer j.opMu.Unlock()
 	// records made from here on are bound for the new generation's journal; what they
 	// record may be in the snapshot as well, and replaying them over it changes nothing
 	pending, generation, _ := j.take(true)
@@ -260,25 +279,40 @@ func (j *journal) compact(now time.Time, each func(yield func(o *Object) bool)) 
 		// these were bound for the generation before, and the snapshot will hold what they record
 		j.recycle(pending)
 	}
+	if err := j.publishSnapshot(generation, now, each); err != nil {
+		// the generations before this one still stand, and are replayed along with its journal
+		j.markLossy()
+		return err
+	}
+	// old generations lingering after a failed removal are dead weight, never evidence:
+	// loading starts from the snapshot that was just published, and the next compaction
+	// lists and removes them again
+	_ = j.removeBefore(generation)
+	return nil
+}
+
+// writes the snapshot whole and publishes it only once its writer closed without error, so
+// a snapshot that is torn by a crash is never visible under its final name
+func (j *journal) publishSnapshot(generation uint64, now time.Time, each func(yield func(o *Object) bool)) error {
 	w, err := j.store.CreateMeta(generationName(snapshotPrefix, generation))
 	if err != nil {
-		j.markLossy()
 		return err
 	}
 	bw := bufio.NewWriterSize(w, snapshotBuffer)
 	scratch := appendMark(make([]byte, 0, recordOverhead+maxRecordKeyLen), now)
 	written := int64(len(scratch))
-	_, err = bw.Write(scratch)
-	nowNano := now.UnixNano()
-	each(func(o *Object) bool {
-		if err != nil || o.transient.Load() || o.expired(nowNano) {
+	if _, err = bw.Write(scratch); err == nil {
+		nowNano := now.UnixNano()
+		each(func(o *Object) bool {
+			if err != nil || o.transient.Load() || o.expired(nowNano) {
+				return err == nil
+			}
+			scratch = appendObject(scratch[:0], o)
+			written += int64(len(scratch))
+			_, err = bw.Write(scratch)
 			return err == nil
-		}
-		scratch = appendObject(scratch[:0], o)
-		written += int64(len(scratch))
-		_, err = bw.Write(scratch)
-		return err == nil
-	})
+		})
+	}
 	if err == nil {
 		err = bw.Flush()
 	}
@@ -286,12 +320,10 @@ func (j *journal) compact(now time.Time, each func(yield func(o *Object) bool)) 
 		err = cerr
 	}
 	if err != nil {
-		// the generations before this one still stand, and are replayed along with its journal
-		j.markLossy()
 		return err
 	}
 	j.snapshotBytes, j.journalBytes = written, 0
-	return j.removeBefore(generation)
+	return nil
 }
 
 func (j *journal) removeBefore(generation uint64) error {
@@ -316,7 +348,7 @@ type loaded struct {
 	lastFlush int64
 	// whole is true when nothing of what was persisted is missing or damaged
 	whole bool
-	// clean is true when the index was closed in good order
+	// clean is true when the index was closed in good order, at the generation in evidence
 	clean bool
 }
 
@@ -345,53 +377,98 @@ func (j *journal) replay(name string, buf []byte, apply func(r *record)) (int64,
 	}
 }
 
-// the latest snapshot, then each journal of its generation and after, in order
+// readClean returns the generation the clean marker vouches for. A marker that is absent,
+// unreadable or carries no generation vouches for nothing at all
+func (j *journal) readClean() (uint64, bool) {
+	f, err := j.store.OpenMeta(cleanMarker)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, generationLen))
+	if err != nil || len(b) == 0 {
+		return 0, false
+	}
+	generation, err := strconv.ParseUint(string(b), decimal, 64)
+	return generation, err == nil
+}
+
+// the newest snapshot that can be read whole, then each journal of its generation and after,
+// in order. A newer snapshot that is damaged falls back to the newest intact one; when every
+// snapshot is damaged, nothing is adopted and the cache is swept anew
 func (j *journal) load(apply func(r *record)) (loaded, error) {
 	names, err := j.store.ListMeta()
 	if err != nil {
 		return loaded{}, err
 	}
 	var l loaded
-	var snapshot string
-	var from uint64
+	var snapshots []uint64
 	var journals []string
+	var hasClean bool
+	var maxGeneration uint64
 	for _, name := range names {
-		if g, ok := generationOf(name, snapshotPrefix); ok && g >= from {
-			snapshot, from = name, g
-		}
-		j.generation = max(j.generation, generationOfAny(name))
-		l.clean = l.clean || name == cleanMarker
-	}
-	for _, name := range names {
-		if g, ok := generationOf(name, journalPrefix); ok && g >= from {
+		if g, ok := generationOf(name, snapshotPrefix); ok {
+			snapshots = append(snapshots, g)
+		} else if _, ok := generationOf(name, journalPrefix); ok {
 			journals = append(journals, name)
+		} else if name == cleanMarker {
+			hasClean = true
 		}
+		maxGeneration = max(maxGeneration, generationOfAny(name))
 	}
+	slices.Sort(snapshots)
 	slices.Sort(journals)
 	// what follows is written to a generation of its own, and the first flush replaces them all
-	j.generation++
-	j.lossy = snapshot != "" || len(journals) > 0
-	if l.clean {
-		// the mark of a good close is taken back, so that it cannot vouch for what comes next
-		if err := j.store.RemoveMeta(cleanMarker); err != nil {
-			return loaded{}, err
-		}
-	}
+	j.generation = maxGeneration + 1
+	j.lossy = len(snapshots) > 0 || len(journals) > 0
 	buf := make([]byte, recordOverhead+maxRecordKeyLen)
-	l.whole = true
-	if snapshot != "" {
-		if l.lastFlush, err = j.replay(snapshot, buf, apply); err != nil {
-			// a snapshot is written whole or not at all, so one that is damaged vouches for nothing
-			return loaded{}, err
+	from := uint64(0)
+	if len(snapshots) > 0 {
+		var intact bool
+		var damage error
+		for i := len(snapshots) - 1; i >= 0; i-- {
+			g := snapshots[i]
+			last, rerr := j.replay(generationName(snapshotPrefix, g), buf, apply)
+			l.lastFlush = max(l.lastFlush, last)
+			if rerr != nil {
+				// a snapshot is written whole or not at all, so a damaged one vouches for nothing;
+				// an older, intact one plus the journals since may still be the complete truth
+				damage = rerr
+				continue
+			}
+			from, intact = g, true
+			break
+		}
+		if !intact {
+			// journals are deltas of the snapshot lineage, and are no substitute for a base
+			// that cannot be proven; the cache itself is the only thing left to reconcile from
+			_ = j.store.RemoveMeta(cleanMarker)
+			return loaded{whole: false}, errors.Join(errDamagedIndex, damage)
 		}
 	}
+	l.whole = true
 	for _, name := range journals {
-		last, err := j.replay(name, buf, apply)
+		if g, ok := generationOf(name, journalPrefix); !ok || g < from {
+			continue
+		}
+		last, rerr := j.replay(name, buf, apply)
 		l.lastFlush = max(l.lastFlush, last)
-		if err != nil {
-			// a journal torn by a crash is good up to the tear
+		if rerr != nil {
+			// a journal torn by a crash, or one that cannot be opened, is good up to the tear,
+			// and what may be past it is found again by the sweep the incomplete load asks for
 			l.whole = false
 		}
+	}
+	var cleanGeneration uint64
+	if hasClean {
+		cleanGeneration, l.clean = j.readClean()
+		// taking the marker back is best effort: a stale one is harmless once it can vouch
+		// only for the generation it names
+		_ = j.store.RemoveMeta(cleanMarker)
+	}
+	// the mark of a good close vouches only while nothing was written past what it closed
+	if l.clean && cleanGeneration < maxGeneration {
+		l.clean = false
 	}
 	return l, nil
 }
@@ -406,7 +483,9 @@ func generationOfAny(name string) uint64 {
 }
 
 // a journal missing records is first replaced by a snapshot, and no mark of a good close is
-// left if that fails
+// left if that fails. The mark carries the generation it closes, in this order: appended
+// records, a complete snapshot, the clean marker -- so a restart can tell what combination
+// was fully published, and a mark left by an older close cannot vouch for a later generation
 func (j *journal) close(now time.Time, each func(yield func(o *Object) bool)) error {
 	compact, err := j.flush(now)
 	if err != nil {
@@ -419,6 +498,10 @@ func (j *journal) close(now time.Time, each func(yield func(o *Object) bool)) er
 	}
 	w, err := j.store.CreateMeta(cleanMarker)
 	if err != nil {
+		return err
+	}
+	if _, err = w.Write(strconv.AppendUint(nil, j.generation, decimal)); err != nil {
+		_ = w.Close()
 		return err
 	}
 	return w.Close()

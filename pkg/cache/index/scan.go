@@ -57,15 +57,47 @@ func (idx *IndexedClient) scannerWorker(ctx context.Context) {
 	})
 }
 
-// an object the cache holds and the index did not know of
+// an object the cache holds and the index did not know of. What the cache says of an object
+// is taken only when it is of its last write: facts older than the index's own never move an
+// object's size, expiration or times backward, while its presence is marked either way
 func (idx *IndexedClient) adopt(m *cache.ObjectMeta, sweep uint64) {
-	o, _ := idx.put(m.Key, m.Size, m.LastWrite.UnixNano(), m.LastWrite.UnixNano(), unixNano(m.Expiration), false)
+	lw := m.LastWrite.UnixNano()
+	expiration := unixNano(m.Expiration)
+	v, listed := idx.objects.Load(m.Key)
+	if !listed {
+		o := &Object{Key: m.Key, slot: noSlot}
+		o.size.Store(m.Size)
+		o.lastWrite.Store(lw)
+		o.lastAccess.Store(lw)
+		o.expiration.Store(expiration)
+		if v, listed = idx.objects.LoadOrStore(m.Key, o); !listed {
+			if size, inserted := idx.shards.of(m.Key).insert(o, lw); inserted {
+				idx.count(size, 1)
+			}
+			o.sweep.Store(sweep)
+			idx.journal.add(o)
+			return
+		}
+	}
+	// a store or adoption racing this one put the entry there; its facts still yield to a
+	// later write
+	o := v.(*Object)
+	if delta, newer := idx.shards.of(m.Key).adoptFacts(o, m.Size, expiration, lw); newer {
+		idx.count(delta, 0)
+		idx.journal.add(o)
+	}
 	o.sweep.Store(sweep)
-	idx.journal.add(o)
 }
 
-// objects the index did not know of are listed; those the cache no longer holds are dropped
+// objects the index did not know of are listed; those the cache no longer holds are dropped.
+// A sweep that does not reach the end changes nothing beyond what it has already found, and
+// never takes the parts it did not scan for missing
 func (idx *IndexedClient) sweep(ctx context.Context) {
+	// one sweep at a time: one already running accounts for everything this one would
+	if !idx.sweepMu.TryLock() {
+		return
+	}
+	defer idx.sweepMu.Unlock()
 	sweep := idx.sweeps.Add(1)
 	start := time.Now()
 	var after string
@@ -81,12 +113,12 @@ func (idx *IndexedClient) sweep(ctx context.Context) {
 			if m.Key == IndexKey {
 				return
 			}
-			if v, ok := idx.objects.Load(m.Key); ok {
-				v.(*Object).sweep.Store(sweep)
-				return
+			// adopt lists what is new and arbitrates what is listed by the object's last
+			// write, so a frame newer than a fact recovered from a torn journal wins
+			if _, listed := idx.objects.Load(m.Key); !listed {
+				adopted++
 			}
 			idx.adopt(&m, sweep)
-			adopted++
 		})
 		if err != nil {
 			logger.Warn("cache sweep was not completed",
@@ -102,7 +134,8 @@ func (idx *IndexedClient) sweep(ctx context.Context) {
 		case <-time.After(time.Duration(o.ScanBatchPause)):
 		}
 	}
-	// an object written since the sweep began may lie behind it, and is left alone
+	// reaching here means every object the cache holds was seen; anything short of that
+	// returned above, keeping what the partial pass had found but judging nothing missing
 	beganNano := start.UnixNano()
 	var lost []string
 	idx.each(func(o *Object) bool {
@@ -112,10 +145,12 @@ func (idx *IndexedClient) sweep(ctx context.Context) {
 		return true
 	})
 	for _, key := range lost {
-		if _, gone := idx.forgetUnlessWrittenSince(key, start); gone {
+		if _, _, gone := idx.forgetUnlessWrittenSince(key, start); gone {
 			dropped++
 		}
 	}
+	// from here the index vouches for all the cache holds, and eviction may run
+	idx.confirmed.Store(true)
 	gm.CacheEvents.WithLabelValues(idx.name, idx.cacheProvider, reasonSweep, reasonAdopted).Add(adopted)
 	gm.CacheEvents.WithLabelValues(idx.name, idx.cacheProvider, reasonSweep, reasonDropped).Add(dropped)
 	metrics.ObserveCacheEvent(idx.name, idx.cacheProvider, eventIndex, reasonSweep)

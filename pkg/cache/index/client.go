@@ -128,9 +128,16 @@ type IndexedClient struct {
 	lastFlush atomic.Int64
 	// pressure is set by a write that takes the cache over its size, to hasten the reaper
 	pressure atomic.Bool
+	// confirmed says the index can vouch for all the cache holds. It is false while a load
+	// found the persisted index torn or untidily closed, until a sweep proves the cache's
+	// contents; while false, the reaper evicts nothing
+	confirmed atomic.Bool
 	// sweeps numbers the sweeps of the cache, and sweepDue asks for one at the start
 	sweeps   atomic.Uint64
 	sweepDue bool
+	// sweepMu lets one sweep run at a time: overlapping sweeps would each mark what they
+	// saw with a different sweep number, and could take one another's objects for lost
+	sweepMu sync.Mutex
 
 	isClosing     atomic.Bool
 	cancel        context.CancelFunc
@@ -173,6 +180,9 @@ func NewIndexedClient(
 	for _, opt := range opts {
 		opt(&idx.ico)
 	}
+	// an index that keeps nothing, or cannot be swept against the cache, vouches for its
+	// own process's view from the start; a persisted load demotes this until it proves out
+	idx.confirmed.Store(true)
 	idx.scanner, _ = client.(cache.Scanner)
 	if sc, ok := client.(cache.SplitClient); ok && sc.SupportsSplit() {
 		idx.split = sc
@@ -211,7 +221,9 @@ func NewIndexedClient(
 	return idx
 }
 
-// whatever is missing from what was persisted is left for a sweep of the cache to find
+// whatever is missing from what was persisted is left for a sweep of the cache to find.
+// Only an index that proves whole, and that was closed in good order, vouches for the
+// cache; the reaper evicts nothing until a sweep confirms one that cannot
 func (idx *IndexedClient) load(client cache.Client, expiry time.Duration) {
 	ms, ok := client.(metaStorer)
 	if !ok {
@@ -239,11 +251,16 @@ func (idx *IndexedClient) load(client cache.Client, expiry time.Duration) {
 		}
 		idx.Clear()
 		idx.journal.markLossy()
-		l.whole = false
+		l.whole, l.clean = false, false
 	}
 	idx.lastFlush.Store(l.lastFlush)
 	// an index that is whole and was closed in good order lists all the cache holds
 	idx.sweepDue = !l.whole || !l.clean
+	// a cache that cannot be swept can never prove a doubtful load, and keeps the trust it
+	// had; one that can sweep must wait for the sweep its doubt asks for
+	if idx.scanner != nil {
+		idx.confirmed.Store(!idx.sweepDue)
+	}
 }
 
 var keyLockSeed = maphash.MakeSeed()
@@ -547,17 +564,17 @@ func (idx *IndexedClient) forget(cacheKey string) int64 {
 
 // an object written since it was chosen for removal is no longer the object that was to go,
 // and stays
-func (idx *IndexedClient) forgetUnlessWrittenSince(cacheKey string, since time.Time) (int64, bool) {
+func (idx *IndexedClient) forgetUnlessWrittenSince(cacheKey string, since time.Time) (*Object, int64, bool) {
 	v, ok := idx.objects.Load(cacheKey)
 	if !ok {
-		return 0, false
+		return nil, 0, false
 	}
 	o := v.(*Object)
 	s := idx.shards.of(cacheKey)
 	s.mu.Lock()
 	if o.lastWrite.Load() >= since.UnixNano() || !idx.objects.CompareAndDelete(cacheKey, o) {
 		s.mu.Unlock()
-		return 0, false
+		return nil, 0, false
 	}
 	size := s.removeLocked(o)
 	s.mu.Unlock()
@@ -565,7 +582,46 @@ func (idx *IndexedClient) forgetUnlessWrittenSince(cacheKey string, since time.T
 	if !o.transient.Load() {
 		idx.journal.remove(cacheKey)
 	}
-	return size, true
+	return o, size, true
+}
+
+// an evictedEntry is what the index had taken of one object before its frame was removed,
+// so the taking can be undone when that removal is not known to have happened
+type evictedEntry struct {
+	o         *Object
+	size      int64
+	transient bool
+}
+
+// puts entries back in the index after the cache's response left their removal in doubt.
+// The caller holds the keys' locks. An object written again since its taking is newer than
+// what was removed and stands as it is. What returns is counted, scheduled and eligible for
+// eviction again
+func (idx *IndexedClient) relistLocked(keys []string, entries []evictedEntry) {
+	for i, key := range keys {
+		e := entries[i]
+		if v, ok := idx.objects.Load(key); ok && v.(*Object).lastWrite.Load() >= e.o.lastWrite.Load() {
+			continue
+		}
+		o := &Object{Key: key, slot: noSlot}
+		o.size.Store(e.o.size.Load())
+		o.expiration.Store(e.o.expiration.Load())
+		o.lastWrite.Store(e.o.lastWrite.Load())
+		o.lastAccess.Store(e.o.lastAccess.Load())
+		o.transient.Store(e.transient)
+		if v, loaded := idx.objects.LoadOrStore(key, o); loaded {
+			// a concurrent write or sweep adoption put the key back first; the newer fact stands
+			_ = v
+			continue
+		}
+		if counted, inserted := idx.shards.of(key).insert(o, e.o.lastWrite.Load()); inserted {
+			idx.count(counted, 1)
+		}
+		if !e.transient {
+			// the remove record the taking left is answered by this add, on replay as well
+			idx.journal.add(o)
+		}
+	}
 }
 
 // Remove implements the cache.Client interface and removes the object from the cache and index
@@ -593,11 +649,13 @@ func (idx *IndexedClient) evict(reason string, since time.Time, removals []strin
 	// reaper removals bypass the cache manager, so the deletion is recorded here
 	start := time.Now()
 	unlock := idx.lockKeys(removals)
-	var released int64
+	var entries []evictedEntry
 	// under the locks, what the index still lists as older than since is what the cache holds
 	gone := removals[:0]
+	var released int64
 	for _, key := range removals {
-		if size, dropped := idx.forgetUnlessWrittenSince(key, since); dropped {
+		if o, size, dropped := idx.forgetUnlessWrittenSince(key, since); dropped {
+			entries = append(entries, evictedEntry{o: o, size: size, transient: o.transient.Load()})
 			released += size
 			gone = append(gone, key)
 		} else if v, ok := idx.objects.Load(key); ok {
@@ -613,6 +671,13 @@ func (idx *IndexedClient) evict(reason string, since time.Time, removals []strin
 	if len(gone) > 0 {
 		err = idx.Client.Remove(gone...)
 	}
+	if err != nil {
+		// the cache's answer leaves any of the removals in doubt, so the index claims none of
+		// them: the entries return to the counts and can be chosen again once the cache answers
+		idx.relistLocked(gone, entries)
+		released = 0
+		idx.pressure.Store(true)
+	}
 	unlock()
 	metrics.ObserveCacheDel(idx.name, idx.cacheProvider, float64(released), time.Since(start))
 	if err != nil {
@@ -620,12 +685,22 @@ func (idx *IndexedClient) evict(reason string, since time.Time, removals []strin
 	}
 }
 
+// closeWorkerTimeout bounds the wait for index workers to finish while closing; a close past
+// it persists nothing more, so it cannot interleave with a worker that is still running, and
+// leaves the index on disk in a state the next start can classify and recover
+var closeWorkerTimeout = 30 * time.Second
+
 // Stop the indexed cache, flush its state, and close the underlying cache
 func (idx *IndexedClient) Close() error {
 	idx.cancel() // stop the workers
 	idx.isClosing.Store(true)
-	idx.wg.Wait() // wait for the worker goroutines to exit
-	if idx.journal != nil {
+	if !idx.waitForWorkers(closeWorkerTimeout) {
+		logger.Error("cache index workers did not stop before the close timeout; leaving the index to be recovered on start",
+			logging.Pairs{
+				keys.CacheName: idx.name, keys.CacheProvider: idx.cacheProvider,
+				"timeout": closeWorkerTimeout.String(),
+			})
+	} else if idx.journal != nil {
 		now := time.Now()
 		if err := idx.journal.close(now, idx.each); err != nil {
 			logger.Warn("unable to persist cache index on close",
@@ -636,6 +711,21 @@ func (idx *IndexedClient) Close() error {
 	}
 	idx.Clear()
 	return idx.Client.Close()
+}
+
+// waitForWorkers reports whether every index worker stopped within timeout
+func (idx *IndexedClient) waitForWorkers(timeout time.Duration) bool {
+	stopped := make(chan struct{})
+	go func() {
+		idx.wg.Wait()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // tells a test that waits on done that a worker has finished a pass

@@ -346,9 +346,8 @@ func TestLoadFailures(t *testing.T) {
 	s.MetaErr = nil
 
 	for name, j := range map[string]*journal{
-		"list":   {store: failingMeta{MemStore: s, list: true}},
-		"open":   {store: failingMeta{MemStore: s, open: true}},
-		"remove": {store: failingMeta{MemStore: s, remove: true}},
+		"list": {store: failingMeta{MemStore: s, list: true}},
+		"open": {store: failingMeta{MemStore: s, open: true}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s.SetMeta(cleanMarker, nil)
@@ -360,6 +359,16 @@ func TestLoadFailures(t *testing.T) {
 			require.False(t, l.whole)
 		})
 	}
+	// an uncertain response removing the clean marker is harmless: the marker is generation
+	// scoped, and one that is empty vouches for nothing anyway
+	t.Run("remove", func(t *testing.T) {
+		j := &journal{store: failingMeta{MemStore: s, remove: true}}
+		s.SetMeta(cleanMarker, nil)
+		l, err := j.load(func(*record) {})
+		require.NoError(t, err)
+		require.True(t, l.whole)
+		require.False(t, l.clean)
+	})
 	// a journal that cannot be opened is passed over, as one torn at its start is
 	require.NoError(t, s.RemoveMeta(generationName(snapshotPrefix, 1)))
 	j := &journal{store: failingMeta{MemStore: s, open: true}}
