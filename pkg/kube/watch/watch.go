@@ -73,6 +73,7 @@ const (
 	KindPublishedSvc    = "PublishedService"
 	kindBackendTLS      = ir.KindBackendTLSPolicy
 	kindBackendTraffic  = ir.KindBackendTrafficPolicy
+	kindListenerSet     = ir.KindListenerSet
 	eventAdd            = "add"
 	eventUpdate         = "update"
 	eventDelete         = "delete"
@@ -144,6 +145,7 @@ type scope struct {
 	configMaps corelisters.ConfigMapLister
 	ingresses  netlisters.IngressLister
 	gateways   gwlisters.GatewayLister
+	listenerSets gwlisters.ListenerSetLister
 	routes     gwlisters.HTTPRouteLister
 	grpcRoutes gwlisters.GRPCRouteLister
 	tcpRoutes  gwlistersv1a2.TCPRouteLister
@@ -164,6 +166,10 @@ const resourceBackendTLSPolicies = "backendtlspolicies"
 // resourceGRPCRoutes is the Gateway API resource for gRPC routes, gated like BackendTLSPolicy
 // since a cluster may serve an older channel of the group without it
 const resourceGRPCRoutes = "grpcroutes"
+
+// resourceListenerSets is the Gateway API resource attaching listeners to a Gateway, gated like
+// GRPCRoute since a cluster may serve an older release of the group without it
+const resourceListenerSets = "listenersets"
 
 // The experimental Gateway API resources for stream routes, each served only by a cluster that
 // installed the experimental channel
@@ -368,6 +374,11 @@ func (w *Watcher) buildScope(ns string, resync time.Duration) (*scope, error) {
 			grInf := gw.Factory().Gateway().V1().GRPCRoutes()
 			s.grpcRoutes = grInf.Lister()
 			informers = append(informers, kindInformer{ir.KindGRPCRoute, grInf.Informer()})
+		}
+		if w.serves(resourceListenerSets) {
+			lsInf := gw.Factory().Gateway().V1().ListenerSets()
+			s.listenerSets = lsInf.Lister()
+			informers = append(informers, kindInformer{kindListenerSet, lsInf.Informer()})
 		}
 		if w.servesX(gatewayapi.ResourceBackendTrafficPolicies) {
 			inf := gw.Factory().Experimental().V1alpha1().XBackendTrafficPolicies()

@@ -1252,6 +1252,133 @@ func TestControllerTranslatesGatewayAPIObjects(t *testing.T) {
 	}, "the Gateway listener's certificate was not pushed")
 }
 
+// TestControllerServesListenerSets reconciles an attached ListenerSet through the whole loop:
+// its listener and a route naming it reach the published overlay, status reports the attachment,
+// and deleting the set withdraws the listener on the next whole-world pass
+func TestControllerServesListenerSets(t *testing.T) {
+	same := gwapiv1.NamespacesFromSame
+	gw := &gwapiv1.Gateway{
+		Namespace: "shop", Name: "gw",
+		Spec: gwapiv1.GatewaySpec{
+			GatewayClassName: "trickster",
+			AllowedListeners: &gwapiv1.AllowedListeners{Namespaces: &gwapiv1.ListenerNamespaces{
+				From: &same,
+			}},
+			Listeners: []gwapiv1.Listener{
+				{Name: "http", Port: 80, Protocol: gwapiv1.HTTPProtocolType},
+			},
+		},
+	}
+	lset := &gwapiv1.ListenerSet{
+		Namespace: "shop", Name: "extra",
+		Spec: gwapiv1.ListenerSetSpec{
+			ParentRef: gwapiv1.ParentGatewayReference{Name: "gw"},
+			Listeners: []gwapiv1.ListenerEntry{
+				{Name: "extra", Port: 8080, Protocol: gwapiv1.HTTPProtocolType},
+			},
+		},
+	}
+	setKind := gwapiv1.Kind("ListenerSet")
+	port := gwapiv1.PortNumber(8080)
+	route := &gwapiv1.HTTPRoute{
+		Namespace: "shop", Name: "web",
+		Spec: gwapiv1.HTTPRouteSpec{
+			CommonRouteSpec: gwapiv1.CommonRouteSpec{ParentRefs: []gwapiv1.ParentReference{
+				{Name: "gw"},
+				{Name: "extra", Kind: &setKind},
+			}},
+			Hostnames: []gwapiv1.Hostname{"shop.example.com"},
+			Rules: []gwapiv1.HTTPRouteRule{{
+				BackendRefs: []gwapiv1.HTTPBackendRef{{Name: "web-svc", Port: &port}},
+			}},
+		},
+	}
+	gwcs := gwfake.NewSimpleClientset(
+		&gwapiv1.GatewayClass{Name: "trickster", Spec: gwapiv1.GatewayClassSpec{
+			ControllerName: kubecfg.DefaultGatewayClassControllerName,
+		}},
+		lset, route,
+	)
+	require.NoError(t, gwcs.Tracker().Create(gatewayGVR, gw, gw.Namespace))
+	p := &publisher{}
+	c, err := New(Config{
+		Options:       options(t),
+		Publisher:     p,
+		Client:        kube.NewFromClientset(kubefake.NewClientset(service())),
+		GatewayClient: gwcs,
+	})
+	require.NoError(t, err)
+	t.Cleanup(c.Stop)
+	require.NoError(t, c.Start(t.Context()))
+
+	// both the inline and attached listeners reach one atomic overlay, with the route on each
+	eventually(t, func() bool {
+		return strings.Contains(string(p.last().Data), "kgw--listener-http-8080") &&
+			strings.Contains(string(p.last().Data), "kgw--listener-http-80")
+	}, "the attached listener never reached the published overlay")
+
+	eventually(t, func() bool {
+		got, err := gwcs.GatewayV1().ListenerSets("shop").Get(t.Context(), "extra",
+			metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		return meta.IsStatusConditionTrue(got.Status.Conditions, "Accepted") &&
+			meta.IsStatusConditionTrue(got.Status.Conditions, "Programmed") &&
+			len(got.Status.Listeners) == 1 && got.Status.Listeners[0].AttachedRoutes == 1
+	}, "the ListenerSet status was not written")
+	eventually(t, func() bool {
+		got, err := gwcs.GatewayV1().Gateways("shop").Get(t.Context(), "gw", metav1.GetOptions{})
+		return err == nil && got.Status.AttachedListenerSets != nil &&
+			*got.Status.AttachedListenerSets == 1
+	}, "the Gateway never reported the attached set")
+	eventually(t, func() bool {
+		got, err := gwcs.GatewayV1().HTTPRoutes("shop").Get(t.Context(), "web",
+			metav1.GetOptions{})
+		if err != nil || len(got.Status.Parents) != 2 {
+			return false
+		}
+		for _, parent := range got.Status.Parents {
+			if meta.FindStatusCondition(parent.Conditions, "Accepted").Status !=
+				metav1.ConditionTrue {
+				return false
+			}
+		}
+		return true
+	}, "the route was not accepted on both direct parents")
+
+	// deleting the set withdraws its listener and the attachment count on the next snapshot
+	require.NoError(t, gwcs.GatewayV1().ListenerSets("shop").Delete(t.Context(), "extra",
+		metav1.DeleteOptions{}))
+	eventually(t, func() bool {
+		return !strings.Contains(string(p.last().Data), "kgw--listener-http-8080")
+	}, "the deleted listener still serves")
+	eventually(t, func() bool {
+		got, err := gwcs.GatewayV1().Gateways("shop").Get(t.Context(), "gw", metav1.GetOptions{})
+		return err == nil && got.Status.AttachedListenerSets == nil
+	}, "the attached count was not withdrawn")
+	// the route keeps its Gateway parent while the ListenerSet parent is refused
+	eventually(t, func() bool {
+		got, err := gwcs.GatewayV1().HTTPRoutes("shop").Get(t.Context(), "web",
+			metav1.GetOptions{})
+		if err != nil || len(got.Status.Parents) != 2 {
+			return false
+		}
+		var gwAccepted, setRefused bool
+		for _, parent := range got.Status.Parents {
+			accepted := meta.FindStatusCondition(parent.Conditions, "Accepted")
+			if parent.ParentRef.Kind == nil && accepted.Status == metav1.ConditionTrue {
+				gwAccepted = true
+			}
+			if parent.ParentRef.Kind != nil && *parent.ParentRef.Kind == "ListenerSet" &&
+				accepted.Status == metav1.ConditionFalse {
+				setRefused = true
+			}
+		}
+		return gwAccepted && setRefused
+	}, "the route's parents did not settle after the deletion")
+}
+
 // recorder captures Events as type, reason and object
 type recorder struct {
 	mtx    sync.Mutex

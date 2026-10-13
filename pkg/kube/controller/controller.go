@@ -999,19 +999,40 @@ func markProgrammed(model *ir.IR, report *ir.Report, installed map[certKey]struc
 	}
 }
 
-// listenerPos locates one listener status entry within a report
-type listenerPos struct{ gateway, listener int }
+// listenerPosKind says which status list a listener entry addresses
+type listenerPosKind uint8
 
-// listenerIndex finds a Gateway listener's status entry by Gateway key and section name, built
-// once per report so lowering many listeners does not rescan every Gateway
-type listenerIndex map[string]listenerPos
+const (
+	posGateway listenerPosKind = iota
+	posListenerSet
+)
+
+type listenerEntryPos struct {
+	kind              listenerPosKind
+	gateway, listener int
+}
+
+// listenerIndex finds a listener's status entry by its owning object key and section name, in
+// either a Gateway's inline listeners or an attached ListenerSet's entries; it is built once per
+// report so lowering many listeners does not rescan every object
+type listenerIndex map[string]listenerEntryPos
 
 func indexListeners(report *ir.Report) listenerIndex {
 	index := make(listenerIndex)
 	for gi := range report.Gateways {
 		key := report.Gateways[gi].Source.Key()
 		for li, l := range report.Gateways[gi].Listeners {
-			index[key+"\x00"+l.Name] = listenerPos{gateway: gi, listener: li}
+			index[key+"\x00"+l.Name] = listenerEntryPos{
+				kind: posGateway, gateway: gi, listener: li,
+			}
+		}
+	}
+	for si := range report.ListenerSets {
+		key := report.ListenerSets[si].Source.Key()
+		for li, l := range report.ListenerSets[si].Listeners {
+			index[key+"\x00"+l.Name] = listenerEntryPos{
+				kind: posListenerSet, gateway: si, listener: li,
+			}
 		}
 	}
 	return index
@@ -1021,6 +1042,9 @@ func (x listenerIndex) lookup(report *ir.Report, l ir.Listener) *ir.ListenerStat
 	pos, ok := x[l.Source.Key()+"\x00"+l.Section]
 	if !ok {
 		return nil
+	}
+	if pos.kind == posListenerSet {
+		return &report.ListenerSets[pos.gateway].Listeners[pos.listener]
 	}
 	return &report.Gateways[pos.gateway].Listeners[pos.listener]
 }

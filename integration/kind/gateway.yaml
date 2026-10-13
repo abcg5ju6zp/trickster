@@ -523,8 +523,9 @@ spec:
         - name: webecho-canary
           port: 80
       sessionPersistence:
-        sessionName: gw-session
         type: Cookie
+        cookie:
+          name: gw-session
     - matches:
         - path:
             type: PathPrefix
@@ -535,8 +536,9 @@ spec:
         - name: webecho-canary
           port: 80
       sessionPersistence:
-        sessionName: X-Gw-Session
         type: Header
+        header:
+          name: X-Gw-Session
 ---
 # WebSocket echo, large bodies and cacheable responses; the policy below
 # makes the route cache what go-httpbin says may be cached

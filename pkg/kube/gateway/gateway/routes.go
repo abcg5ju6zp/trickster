@@ -548,11 +548,16 @@ func (t *translator) emit(p *routePlan) {
 	}
 }
 
-// claimedParent is one parentRef naming a Gateway this controller claims
+// claimedParent is one parentRef naming a Gateway or ListenerSet this controller claims
 type claimedParent struct {
 	pr gwapiv1.ParentReference
 	gw *gatewayState
-	ns string
+	// lset is the ListenerSet a parentRef of that kind names; nil for a Gateway parentRef
+	lset *listenerSetState
+	// missing marks a ListenerSet parentRef the cache no longer holds, so its deletion withdraws
+	// a stale route acceptance rather than the route keeping a status a vanished object earned
+	missing bool
+	ns      string
 }
 
 func (t *translator) claimedParents(src ir.Source, hr *gwapiv1.HTTPRoute) []claimedParent {
@@ -564,11 +569,28 @@ func (t *translator) claimedParents(src ir.Source, hr *gwapiv1.HTTPRoute) []clai
 			group = string(*pr.Group)
 		}
 		kind := translate.KindOf(pr.Kind, kindGateway)
-		if group != gwapiv1.GroupName || kind != kindGateway {
+		if group != gwapiv1.GroupName ||
+			(kind != kindGateway && kind != ir.KindListenerSet) {
 			t.reject(src, "parentRef %q: kind %s/%s is not supported", pr.Name, group, kind)
 			continue
 		}
 		ns := translate.NamespaceOf(pr.Namespace, hr.Namespace)
+		if kind == ir.KindListenerSet {
+			// a route's direct parent is the ListenerSet itself: it attaches only to that set's
+			// entries, never to the parent Gateway's inline listeners
+			lset, claimed := t.listenerSets[translate.NamespacedName(ns, string(pr.Name))]
+			if claimed {
+				out = append(out, claimedParent{pr: pr, gw: lset.parent, lset: lset, ns: ns})
+				continue
+			}
+			// an object still in cache but parented to a Gateway another controller claims is not
+			// ours to judge; one the cache does not hold has been deleted, so its parent entry is
+			// refused instead of left stale
+			if t.cfg.Cache.ListenerSet(ns, string(pr.Name)) == nil {
+				out = append(out, claimedParent{pr: pr, missing: true, ns: ns})
+			}
+			continue
+		}
 		gw, claimed := t.gateways[translate.NamespacedName(ns, string(pr.Name))]
 		if !claimed {
 			continue
@@ -597,14 +619,32 @@ func (t *translator) attachments(src ir.Source, hr *gwapiv1.HTTPRoute,
 	seen := make(map[string]struct{})
 	for _, p := range parents {
 		pr, gw, ns := p.pr, p.gw, p.ns
-		if !gw.served {
-			msg := fmt.Sprintf("parentRef %s/%s: %s", ns, pr.Name, gw.refusal)
+		if p.missing {
+			// the ListenerSet this parentRef named is gone: the stale acceptance is withdrawn
+			// without a problem Event, as a deletion rather than a misconfiguration
+			msg := fmt.Sprintf("parentRef %s %s/%s: the ListenerSet was not found",
+				ir.KindListenerSet, ns, pr.Name)
+			report.parent(pr, false, gwapiv1.RouteReasonNoMatchingParent, msg)
+			continue
+		}
+		// a ListenerSet parentRef attaches to the set's entries, a Gateway parentRef to its inline
+		// listeners; the set's serving and namespace are what the direct parent supplies
+		pool, parentNS, served, refusal := gw.listeners, gw.src.Namespace, gw.served, gw.refusal
+		parentKind := kindGateway
+		if p.lset != nil {
+			lset := p.lset
+			pool, parentNS, served = lset.listeners, lset.src.Namespace, lset.served
+			parentKind = ir.KindListenerSet
+			refusal = lset.acceptMsg
+		}
+		if !served {
+			msg := fmt.Sprintf("parentRef %s %s/%s: %s", parentKind, ns, pr.Name, refusal)
 			report.parent(pr, false, gwapiv1.RouteReasonNoMatchingParent, msg)
 			t.reject(src, "%s", msg)
 			continue
 		}
 		var candidates []*listenerState
-		for _, l := range gw.listeners {
+		for _, l := range pool {
 			if pr.SectionName != nil && l.section != string(*pr.SectionName) {
 				continue
 			}
@@ -614,15 +654,15 @@ func (t *translator) attachments(src ir.Source, hr *gwapiv1.HTTPRoute,
 			candidates = append(candidates, l)
 		}
 		if len(candidates) == 0 {
-			msg := fmt.Sprintf("parentRef %s/%s: no listener matches %s", ns, pr.Name,
-				parentSelector(pr))
+			msg := fmt.Sprintf("parentRef %s %s/%s: no listener matches %s", parentKind, ns,
+				pr.Name, parentSelector(pr))
 			report.parent(pr, false, gwapiv1.RouteReasonNoMatchingParent, msg)
 			t.reject(src, "%s", msg)
 			continue
 		}
 		var accepted, refused, unmatched int
 		for _, l := range candidates {
-			if !l.allowed.admits(src.Kind, gw.src.Namespace, hr.Namespace,
+			if !l.allowed.admits(src.Kind, parentNS, hr.Namespace,
 				t.cfg.Cache.Namespace(hr.Namespace)) {
 				refused++
 				continue
@@ -643,13 +683,13 @@ func (t *translator) attachments(src ir.Source, hr *gwapiv1.HTTPRoute,
 		case accepted > 0:
 			report.parent(pr, true, gwapiv1.RouteReasonAccepted, "the route is attached")
 		case refused > 0:
-			msg := fmt.Sprintf("parentRef %s/%s: no listener allows routes from namespace %q",
-				ns, pr.Name, hr.Namespace)
+			msg := fmt.Sprintf("parentRef %s %s/%s: no listener allows routes from namespace %q",
+				parentKind, ns, pr.Name, hr.Namespace)
 			report.parent(pr, false, gwapiv1.RouteReasonNotAllowedByListeners, msg)
 			t.reject(src, "%s", msg)
 		default:
-			msg := fmt.Sprintf("parentRef %s/%s: no listener hostname intersects the route's",
-				ns, pr.Name)
+			msg := fmt.Sprintf("parentRef %s %s/%s: no listener hostname intersects the route's",
+				parentKind, ns, pr.Name)
 			report.parent(pr, false, gwapiv1.RouteReasonNoMatchingListenerHostname, msg)
 			t.reject(src, "%s", msg)
 		}

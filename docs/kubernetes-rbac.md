@@ -21,6 +21,7 @@ instance does not need them.
 | `gateway.networking.k8s.io` | `gateways` | get, list, watch | Namespaced | Listeners, hostnames, TLS references; `get` as above |
 | `gateway.networking.k8s.io` | `httproutes` | get, list, watch | Namespaced | Route matches and backend references; `get` as above |
 | `gateway.networking.k8s.io` | `grpcroutes` | get, list, watch | Namespaced | gRPC method matches and backend references; only in a cluster whose Gateway API serves the kind, and `get` as above |
+| `gateway.networking.k8s.io` | `listenersets` | get, list, watch | Namespaced | Listeners attached to a Gateway through `allowedListeners`; only in a cluster whose Gateway API serves the kind, and `get` as above |
 | `gateway.networking.k8s.io` | `tcproutes`, `tlsroutes`, `udproutes` | get, list, watch | Namespaced | Stream route backend references and, for TLSRoute, server names; only in a cluster whose experimental Gateway API channel (`v1alpha2`) serves the kind, and `get` as above |
 | `gateway.networking.k8s.io` | `referencegrants` | list, watch | Namespaced | Permitting cross-namespace Service and Secret references |
 | `gateway.networking.k8s.io` | `backendtlspolicies` | list, watch | Namespaced | TLS to backends; only in a cluster whose Gateway API serves the kind |
@@ -106,7 +107,8 @@ read-only describes the relationship with the cluster, not the data plane.
 | API group | Resource | Verbs | Scope | Why |
 | --- | --- | --- | --- | --- |
 | `gateway.networking.k8s.io` | `gatewayclasses/status` | update | Cluster | Accepted condition on claimed classes |
-| `gateway.networking.k8s.io` | `gateways/status` | update | Namespaced | Accepted and Programmed conditions, listener conditions, and published addresses |
+| `gateway.networking.k8s.io` | `gateways/status` | update | Namespaced | Accepted and Programmed conditions, listener conditions, published addresses, and the attached ListenerSet count |
+| `gateway.networking.k8s.io` | `listenersets/status` | update | Namespaced | Accepted and Programmed conditions, and per-entry listener conditions |
 | `gateway.networking.k8s.io` | `httproutes/status` | update | Namespaced | Per-parent Accepted and ResolvedRefs conditions |
 | `gateway.networking.k8s.io` | `grpcroutes/status` | update | Namespaced | The same, for GRPCRoutes |
 | `gateway.networking.k8s.io` | `tcproutes/status`, `tlsroutes/status`, `udproutes/status` | update | Namespaced | The same, for the stream route kinds where the cluster serves them |

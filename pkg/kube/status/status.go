@@ -90,6 +90,7 @@ func Addresses(svc *corev1.Service) []Address {
 type Cache interface {
 	GatewayClass(name string) *gwapiv1.GatewayClass
 	Gateway(namespace, name string) *gwapiv1.Gateway
+	ListenerSet(namespace, name string) *gwapiv1.ListenerSet
 	HTTPRoute(namespace, name string) *gwapiv1.HTTPRoute
 	GRPCRoute(namespace, name string) *gwapiv1.GRPCRoute
 	TCPRoute(namespace, name string) *gwapiv1a2.TCPRoute
@@ -148,6 +149,7 @@ func (w *Writer) Write(ctx context.Context, in Input) int {
 	if w.cfg.GatewayClient != nil {
 		failed += w.writeClasses(ctx, in)
 		failed += w.writeGateways(ctx, in)
+		failed += w.writeListenerSets(ctx, in)
 		failed += w.writeRoutes(ctx, in)
 	}
 	if w.cfg.Client != nil {
@@ -233,18 +235,49 @@ func (w *Writer) writeGateways(ctx context.Context, in Input) int {
 		}
 		api := w.cfg.GatewayClient.GatewayV1().Gateways(obj.Namespace)
 		apply := func(o *gwapiv1.Gateway) { applyGateway(o, g, in) }
-		if !write(ctx, w, g.Source, obj, apply,
-			func(ctx context.Context) (*gwapiv1.Gateway, error) {
-				return api.Get(ctx, obj.Name, metav1.GetOptions{})
-			},
-			func(ctx context.Context, o *gwapiv1.Gateway) error {
-				_, err := api.UpdateStatus(ctx, o, metav1.UpdateOptions{})
-				return err
-			}) {
+		if !w.applyStatus[gwapiv1.Gateway](ctx, g.Source, obj, api.Get, api.UpdateStatus, apply) {
 			failed++
 		}
 	}
 	return failed
+}
+
+func (w *Writer) writeListenerSets(ctx context.Context, in Input) int {
+	var failed int
+	for _, s := range in.Report.ListenerSets {
+		if ctx.Err() != nil {
+			return failed
+		}
+		obj := w.cfg.Cache.ListenerSet(s.Source.Namespace, s.Source.Name)
+		if obj == nil {
+			continue
+		}
+		api := w.cfg.GatewayClient.GatewayV1().ListenerSets(obj.Namespace)
+		apply := func(o *gwapiv1.ListenerSet) { applyListenerSet(o, s, in) }
+		if !w.applyStatus[gwapiv1.ListenerSet](ctx, s.Source, obj, api.Get, api.UpdateStatus, apply) {
+			failed++
+		}
+	}
+	return failed
+}
+
+// applyStatus runs the shared read-modify-write-with-conflict-retry path for one status object:
+// get reads a fresh copy after a conflict, put writes it, and apply rebuilds this controller's
+// status entry on whatever copy is written
+func (w *Writer) applyStatus[T any, P statusObject[T]](ctx context.Context, src ir.Source,
+	cached P,
+	get func(context.Context, string, metav1.GetOptions) (P, error),
+	put func(context.Context, P, metav1.UpdateOptions) (P, error),
+	apply func(P),
+) bool {
+	return write(ctx, w, src, cached, apply,
+		func(ctx context.Context) (P, error) {
+			return get(ctx, cached.GetName(), metav1.GetOptions{})
+		},
+		func(ctx context.Context, o P) error {
+			_, err := put(ctx, o, metav1.UpdateOptions{})
+			return err
+		})
 }
 
 func (w *Writer) writeRoutes(ctx context.Context, in Input) int {
@@ -452,6 +485,16 @@ func applyGateway(o *gwapiv1.Gateway, g ir.GatewayStatus, in Input) {
 		meta.SetStatusCondition(&o.Status.Conditions, condition(programmed(c, in, true), generation))
 	}
 	o.Status.Addresses = gatewayAddresses(in.Addresses)
+	// the count is replaced every pass, so a ListenerSet that detached clears a value the Gateway
+	// still carries; a Gateway not using the feature keeps the field unset
+	if g.AttachedListenerSets > 0 {
+		// #nosec G115 -- a Gateway admits a small, API-bounded number of ListenerSets, nowhere
+		// near int32 range
+		n := int32(g.AttachedListenerSets)
+		o.Status.AttachedListenerSets = &n
+	} else {
+		o.Status.AttachedListenerSets = nil
+	}
 	previous := make(map[string][]metav1.Condition, len(o.Status.Listeners))
 	for _, l := range o.Status.Listeners {
 		previous[string(l.Name)] = l.Conditions
@@ -459,6 +502,37 @@ func applyGateway(o *gwapiv1.Gateway, g ir.GatewayStatus, in Input) {
 	listeners := make([]gwapiv1.ListenerStatus, 0, len(g.Listeners))
 	for _, l := range g.Listeners {
 		ls := gwapiv1.ListenerStatus{
+			Name:           gwapiv1.SectionName(l.Name),
+			AttachedRoutes: int32(l.AttachedRoutes), // #nosec G115 -- bounded by the object's own listener count
+			Conditions:     slices.Clone(previous[l.Name]),
+		}
+		for _, k := range l.SupportedKinds {
+			group := gwapiv1.Group(gwapiv1.GroupName)
+			ls.SupportedKinds = append(ls.SupportedKinds,
+				gwapiv1.RouteGroupKind{Group: &group, Kind: gwapiv1.Kind(k)})
+		}
+		for _, c := range l.Conditions {
+			meta.SetStatusCondition(&ls.Conditions, condition(programmed(c, in, false), generation))
+		}
+		listeners = append(listeners, ls)
+	}
+	o.Status.Listeners = listeners
+}
+
+func applyListenerSet(o *gwapiv1.ListenerSet, s ir.ListenerSetStatus, in Input) {
+	generation := s.Source.Generation
+	for _, c := range s.Conditions {
+		// a ListenerSet's Programmed waits on the same data plane a Gateway's does, but no
+		// published address gates it
+		meta.SetStatusCondition(&o.Status.Conditions, condition(programmed(c, in, false), generation))
+	}
+	previous := make(map[string][]metav1.Condition, len(o.Status.Listeners))
+	for _, l := range o.Status.Listeners {
+		previous[string(l.Name)] = l.Conditions
+	}
+	listeners := make([]gwapiv1.ListenerEntryStatus, 0, len(s.Listeners))
+	for _, l := range s.Listeners {
+		ls := gwapiv1.ListenerEntryStatus{
 			Name:           gwapiv1.SectionName(l.Name),
 			AttachedRoutes: int32(l.AttachedRoutes), // #nosec G115 -- bounded by the object's own listener count
 			Conditions:     slices.Clone(previous[l.Name]),

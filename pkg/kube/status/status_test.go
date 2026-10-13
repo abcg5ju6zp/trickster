@@ -55,39 +55,44 @@ var gatewayGVR = schema.GroupVersionResource{
 
 // cache is a Cache over fixed objects, which a test updates with what was written
 type cache struct {
-	classes   map[string]*gwapiv1.GatewayClass
-	gateways  map[string]*gwapiv1.Gateway
-	routes    map[string]*gwapiv1.HTTPRoute
-	grpc      map[string]*gwapiv1.GRPCRoute
-	tcp       map[string]*gwapiv1a2.TCPRoute
-	tlsRoutes map[string]*gwapiv1a2.TLSRoute
-	udp       map[string]*gwapiv1a2.UDPRoute
-	ingresses map[string]*netv1.Ingress
-	policies  map[string]*cachepolicy.CachePolicy
+	classes      map[string]*gwapiv1.GatewayClass
+	gateways     map[string]*gwapiv1.Gateway
+	listenerSets map[string]*gwapiv1.ListenerSet
+	routes       map[string]*gwapiv1.HTTPRoute
+	grpc         map[string]*gwapiv1.GRPCRoute
+	tcp          map[string]*gwapiv1a2.TCPRoute
+	tlsRoutes    map[string]*gwapiv1a2.TLSRoute
+	udp          map[string]*gwapiv1a2.UDPRoute
+	ingresses    map[string]*netv1.Ingress
+	policies     map[string]*cachepolicy.CachePolicy
 }
 
 func newCache() *cache {
 	return &cache{
-		classes:   make(map[string]*gwapiv1.GatewayClass),
-		gateways:  make(map[string]*gwapiv1.Gateway),
-		routes:    make(map[string]*gwapiv1.HTTPRoute),
-		grpc:      make(map[string]*gwapiv1.GRPCRoute),
-		tcp:       make(map[string]*gwapiv1a2.TCPRoute),
-		tlsRoutes: make(map[string]*gwapiv1a2.TLSRoute),
-		udp:       make(map[string]*gwapiv1a2.UDPRoute),
-		ingresses: make(map[string]*netv1.Ingress),
-		policies:  make(map[string]*cachepolicy.CachePolicy),
+		classes:      make(map[string]*gwapiv1.GatewayClass),
+		gateways:     make(map[string]*gwapiv1.Gateway),
+		listenerSets: make(map[string]*gwapiv1.ListenerSet),
+		routes:       make(map[string]*gwapiv1.HTTPRoute),
+		grpc:         make(map[string]*gwapiv1.GRPCRoute),
+		tcp:          make(map[string]*gwapiv1a2.TCPRoute),
+		tlsRoutes:    make(map[string]*gwapiv1a2.TLSRoute),
+		udp:          make(map[string]*gwapiv1a2.UDPRoute),
+		ingresses:    make(map[string]*netv1.Ingress),
+		policies:     make(map[string]*cachepolicy.CachePolicy),
 	}
 }
 
 func (c *cache) GatewayClass(name string) *gwapiv1.GatewayClass { return c.classes[name] }
 func (c *cache) Gateway(ns, name string) *gwapiv1.Gateway       { return c.gateways[ns+"/"+name] }
-func (c *cache) HTTPRoute(ns, name string) *gwapiv1.HTTPRoute   { return c.routes[ns+"/"+name] }
-func (c *cache) GRPCRoute(ns, name string) *gwapiv1.GRPCRoute   { return c.grpc[ns+"/"+name] }
-func (c *cache) TCPRoute(ns, name string) *gwapiv1a2.TCPRoute   { return c.tcp[ns+"/"+name] }
-func (c *cache) TLSRoute(ns, name string) *gwapiv1a2.TLSRoute   { return c.tlsRoutes[ns+"/"+name] }
-func (c *cache) UDPRoute(ns, name string) *gwapiv1a2.UDPRoute   { return c.udp[ns+"/"+name] }
-func (c *cache) Ingress(ns, name string) *netv1.Ingress         { return c.ingresses[ns+"/"+name] }
+func (c *cache) ListenerSet(ns, name string) *gwapiv1.ListenerSet {
+	return c.listenerSets[ns+"/"+name]
+}
+func (c *cache) HTTPRoute(ns, name string) *gwapiv1.HTTPRoute { return c.routes[ns+"/"+name] }
+func (c *cache) GRPCRoute(ns, name string) *gwapiv1.GRPCRoute { return c.grpc[ns+"/"+name] }
+func (c *cache) TCPRoute(ns, name string) *gwapiv1a2.TCPRoute { return c.tcp[ns+"/"+name] }
+func (c *cache) TLSRoute(ns, name string) *gwapiv1a2.TLSRoute { return c.tlsRoutes[ns+"/"+name] }
+func (c *cache) UDPRoute(ns, name string) *gwapiv1a2.UDPRoute { return c.udp[ns+"/"+name] }
+func (c *cache) Ingress(ns, name string) *netv1.Ingress       { return c.ingresses[ns+"/"+name] }
 func (c *cache) CachePolicy(ns, name string) *cachepolicy.CachePolicy {
 	return c.policies[ns+"/"+name]
 }
@@ -330,6 +335,95 @@ func TestWriteEverything(t *testing.T) {
 	after := meta.FindStatusCondition(h.c.gateways["infra/gw"].Status.Conditions, "Accepted")
 	require.Equal(t, "still served", after.Message)
 	require.Equal(t, before, after.LastTransitionTime)
+}
+
+func TestWriteListenerSets(t *testing.T) {
+	// a ListenerSet receives its own conditions and per-entry status, its Gateway receives the
+	// attached count, and a data plane that did not take the configuration keeps Programmed off
+	h := newHarness(t)
+	lsetObj := &gwapiv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "infra", Name: "extra", Generation: 6},
+		Spec: gwapiv1.ListenerSetSpec{
+			ParentRef: gwapiv1.ParentGatewayReference{Name: "gw"},
+			Listeners: []gwapiv1.ListenerEntry{{Name: "http", Port: 8080,
+				Protocol: gwapiv1.HTTPProtocolType}},
+		},
+	}
+	created, err := h.gwcs.GatewayV1().ListenerSets("infra").Create(t.Context(), lsetObj,
+		metav1.CreateOptions{})
+	require.NoError(t, err)
+	h.c.listenerSets["infra/extra"] = created
+
+	gwReport := report().Gateways[0]
+	gwReport.AttachedListenerSets = 1
+	in := Input{
+		Programmed: true,
+		Report: &ir.Report{
+			Gateways: []ir.GatewayStatus{gwReport},
+			ListenerSets: []ir.ListenerSetStatus{{
+				Source: ir.Source{
+					Kind: ir.KindListenerSet, Namespace: "infra", Name: "extra", Generation: 6,
+				},
+				Conditions: []ir.Condition{
+					cond("Accepted", true, "Accepted"),
+					cond("Programmed", true, "Programmed"),
+				},
+				Listeners: []ir.ListenerStatus{{
+					Name: "http", SupportedKinds: []string{"HTTPRoute"}, AttachedRoutes: 2,
+					Conditions: []ir.Condition{
+						cond("Accepted", true, "Accepted"),
+						cond("Programmed", true, "Programmed"),
+						cond("ResolvedRefs", true, "ResolvedRefs"),
+						cond("Conflicted", false, "NoConflicts"),
+					},
+				}},
+			}},
+		},
+	}
+	require.Equal(t, 0, h.w.Write(t.Context(), in))
+	got, err := h.gwcs.GatewayV1().ListenerSets("infra").Get(t.Context(), "extra",
+		metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, metav1.ConditionTrue,
+		meta.FindStatusCondition(got.Status.Conditions, "Accepted").Status)
+	require.Equal(t, metav1.ConditionTrue,
+		meta.FindStatusCondition(got.Status.Conditions, "Programmed").Status)
+	require.Len(t, got.Status.Listeners, 1)
+	entry := got.Status.Listeners[0]
+	require.EqualValues(t, "http", entry.Name)
+	require.EqualValues(t, 2, entry.AttachedRoutes)
+	require.Len(t, entry.SupportedKinds, 1)
+	require.EqualValues(t, "HTTPRoute", entry.SupportedKinds[0].Kind)
+	require.EqualValues(t, 6,
+		meta.FindStatusCondition(got.Status.Conditions, "Accepted").ObservedGeneration)
+
+	gw, err := h.gwcs.GatewayV1().Gateways("infra").Get(t.Context(), "gw", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, gw.Status.AttachedListenerSets)
+	require.EqualValues(t, 1, *gw.Status.AttachedListenerSets)
+
+	// the data plane rejecting the pass lowers Programmed on the set and its entry, not Accepted
+	in.Programmed = false
+	require.Equal(t, 0, h.w.Write(t.Context(), in))
+	got, err = h.gwcs.GatewayV1().ListenerSets("infra").Get(t.Context(), "extra",
+		metav1.GetOptions{})
+	require.NoError(t, err)
+	programmed := meta.FindStatusCondition(got.Status.Conditions, "Programmed")
+	require.Equal(t, metav1.ConditionFalse, programmed.Status)
+	require.Equal(t, metav1.ConditionTrue,
+		meta.FindStatusCondition(got.Status.Conditions, "Accepted").Status)
+	require.Equal(t, metav1.ConditionFalse,
+		meta.FindStatusCondition(got.Status.Listeners[0].Conditions, "Programmed").Status)
+
+	// a zero attached count clears the Gateway's field on the next pass, once the cache carries
+	// the field the previous pass wrote
+	h.refresh(t)
+	in.Report.Gateways[0].AttachedListenerSets = 0
+	in.Programmed = true
+	require.Equal(t, 0, h.w.Write(t.Context(), in))
+	gw, err = h.gwcs.GatewayV1().Gateways("infra").Get(t.Context(), gw.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Nil(t, gw.Status.AttachedListenerSets)
 }
 
 func TestWritePolicies(t *testing.T) {

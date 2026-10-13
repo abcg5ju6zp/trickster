@@ -127,6 +127,9 @@ func (p Problem) String() string {
 const (
 	KindGateway      = "Gateway"
 	KindGatewayClass = "GatewayClass"
+	// KindListenerSet is the Gateway API resource that attaches additional listeners to a
+	// Gateway; its entries are lowered and judged with the Gateway's inline listeners
+	KindListenerSet  = "ListenerSet"
 	KindHTTPRoute    = "HTTPRoute"
 	KindGRPCRoute    = "GRPCRoute"
 	KindTCPRoute     = "TCPRoute"

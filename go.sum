@@ -1550,8 +1550,8 @@ mvdan.cc/unparam v0.0.0-20260818115549-3f964bcb5673 h1:dEE6li4OPIE54oojY2qaayFS1
 mvdan.cc/unparam v0.0.0-20260818115549-3f964bcb5673/go.mod h1:62roFV3D3nYOWIXv3PfGO4UYEKAotz2WgLywT87ONd8=
 pgregory.net/rapid v1.3.0 h1:vBvO0VSqti75J1jjYqpgPNBLKMd1+gxa9fYo7vk/Exc=
 pgregory.net/rapid v1.3.0/go.mod h1:dPlE4OBBxgXPqkP79flB6sJL1dx5azpI7HQ9MY9Z7uk=
-sigs.k8s.io/gateway-api v1.6.3 h1:lKpJa5bGlraC/QeACvCpsHLdmO6y0iKfzVl6gzaFEYc=
-sigs.k8s.io/gateway-api v1.6.3/go.mod h1:FVfx3t389ybeXOqvDghLbdvJdSCfI/PReqCUI3lu3mY=
+sigs.k8s.io/gateway-api v1.7.0-rc.1 h1:Bx+qyx8pUj2LvZo9ZK7fdrp/xUbr24CIO8oXgMZfCNE=
+sigs.k8s.io/gateway-api v1.7.0-rc.1/go.mod h1:T+dbkh3cMPjHzzlRFWBMSTOuRUwW6LF4qyo8a96i8XA=
 sigs.k8s.io/json v0.0.0-20260909141634-11ed52e25bc5 h1:k9jo7ED/fsfOcz3L1P20P5tjTNtsdQNwMOG2aKzHrl8=
 sigs.k8s.io/json v0.0.0-20260909141634-11ed52e25bc5/go.mod h1:mdzfpAEoE6DHQEN0uh9ZbOCuHbLK5wOm7dK4ctXE9Tg=
 sigs.k8s.io/randfill v1.0.0 h1:JfjMILfT8A6RbawdsK2JXGBR5AQVfd+9TbzrlneTyrU=

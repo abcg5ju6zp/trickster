@@ -1,0 +1,111 @@
+listeners:
+    kgw--listener-http-80:
+        port: 80
+    kgw--listener-http-8080:
+        port: 8080
+    kgw--listener-https-443:
+        tls_port: 443
+        tls_runtime_certs: true
+backends:
+    kgw--httproute.shop.api_r0:
+        provider: rp
+        origin_url: http://web-svc.shop.svc:8080
+        hosts:
+            - extra.example.com
+        listener_names:
+            - kgw--listener-https-443
+        cache_key_prefix: httproute.shop.api
+        path_routing_disabled: true
+        path_defaults_disabled: true
+        preserve_host: true
+        paths:
+            - path: /api
+              match_type: segment
+              handler: proxy
+              methods:
+                - '*'
+    kgw--httproute.shop.web_r0:
+        provider: rp
+        origin_url: http://web-svc.shop.svc:8080
+        hosts:
+            - extra.example.com
+        listener_names:
+            - kgw--listener-http-80
+        cache_key_prefix: httproute.shop.web
+        path_routing_disabled: true
+        path_defaults_disabled: true
+        preserve_host: true
+        paths:
+            - path: /shop
+              match_type: segment
+              handler: proxy
+              methods:
+                - '*'
+    kgw--httproute.shop.web_r1:
+        provider: rp
+        origin_url: http://web-svc.shop.svc:8080
+        hosts:
+            - shop.example.com
+        listener_names:
+            - kgw--listener-http-80
+        cache_key_prefix: httproute.shop.web
+        path_routing_disabled: true
+        path_defaults_disabled: true
+        preserve_host: true
+        paths:
+            - path: /shop
+              match_type: segment
+              handler: proxy
+              methods:
+                - '*'
+    kgw--httproute.shop.web_r2:
+        provider: rp
+        origin_url: http://web-svc.shop.svc:8080
+        hosts:
+            - extra.example.com
+        listener_names:
+            - kgw--listener-http-8080
+        cache_key_prefix: httproute.shop.web
+        path_routing_disabled: true
+        path_defaults_disabled: true
+        preserve_host: true
+        paths:
+            - path: /shop
+              match_type: segment
+              handler: proxy
+              methods:
+                - '*'
+    kgw--httproute.shop.web_r3:
+        provider: rp
+        origin_url: http://web-svc.shop.svc:8080
+        hosts:
+            - shop.example.com
+        listener_names:
+            - kgw--listener-http-8080
+        cache_key_prefix: httproute.shop.web
+        path_routing_disabled: true
+        path_defaults_disabled: true
+        preserve_host: true
+        paths:
+            - path: /shop
+              match_type: segment
+              handler: proxy
+              methods:
+                - '*'
+    kgw--httproute.shop.web_r4:
+        provider: rp
+        origin_url: http://web-svc.shop.svc:8080
+        hosts:
+            - extra.example.com
+        listener_names:
+            - kgw--listener-https-443
+        cache_key_prefix: httproute.shop.web
+        path_routing_disabled: true
+        path_defaults_disabled: true
+        preserve_host: true
+        paths:
+            - path: /shop
+              match_type: segment
+              handler: proxy
+              methods:
+                - '*'

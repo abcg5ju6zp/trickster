@@ -26,6 +26,7 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/kube/gateway/ir"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwapiv1a2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 	gwapix "sigs.k8s.io/gateway-api/apisx/v1alpha1"
@@ -36,6 +37,10 @@ import (
 type Cache interface {
 	GatewayClasses() []*gwapiv1.GatewayClass
 	Gateways() []*gwapiv1.Gateway
+	ListenerSets() []*gwapiv1.ListenerSet
+	// ListenerSet returns one ListenerSet, or nil when absent or out of scope; the nil answer
+	// distinguishes a deleted direct parent from one parented to an unclaimed Gateway
+	ListenerSet(namespace, name string) *gwapiv1.ListenerSet
 	HTTPRoutes() []*gwapiv1.HTTPRoute
 	GRPCRoutes() []*gwapiv1.GRPCRoute
 	TCPRoutes() []*gwapiv1a2.TCPRoute
@@ -84,11 +89,12 @@ func Translate(cfg Config) (*ir.IR, *ir.Report, []Problem) {
 		return &ir.IR{}, &ir.Report{}, nil
 	}
 	t := &translator{
-		cfg:      cfg,
-		certs:    translate.CertRefs{Judge: cfg.CertJudge, Serving: cfg.CertServing},
-		problems: translate.NewProblems(true),
-		gateways: make(map[string]*gatewayState),
-		claims:   make(map[string]ir.Source),
+		cfg:          cfg,
+		certs:        translate.CertRefs{Judge: cfg.CertJudge, Serving: cfg.CertServing},
+		problems:     translate.NewProblems(true),
+		gateways:     make(map[string]*gatewayState),
+		listenerSets: make(map[string]*listenerSetState),
+		claims:       make(map[string]ir.Source),
 	}
 	var source translate.PolicySource
 	if cfg.Policies != nil {
@@ -122,6 +128,12 @@ type translator struct {
 	// gateways holds every claimed Gateway by namespace/name, with the
 	// listeners that were accepted
 	gateways map[string]*gatewayState
+	// listenerSets holds every ListenerSet attaching to a claimed Gateway, by namespace/name,
+	// whether or not its parent's allowedListeners admitted it
+	listenerSets map[string]*listenerSetState
+	// listenerSetOrder holds every ListenerSet a claimed Gateway parents, in namespace/name
+	// order, so the report lists them deterministically
+	listenerSetOrder []*listenerSetState
 	// certs records each referenced TLS Secret once, however many listeners name it
 	certs translate.CertRefs
 	// claims maps a router entry the translator has awarded to the route
@@ -149,8 +161,21 @@ type gatewayState struct {
 	// says so for the routes naming it
 	served  bool
 	refusal string
-	// listeners are the accepted listeners, in declaration order
+	// listeners are the accepted inline listeners, in declaration order
 	listeners []*listenerState
+	// inline are the Gateway's declared listeners, lowered after the ListenerSets that select
+	// the Gateway have been indexed, so inline and attached listeners share one precedence pass
+	inline []gwapiv1.Listener
+	// allowedFrom and allowedSelector are the parsed spec.allowedListeners.namespaces admission
+	// for selecting ListenerSets; absent allowedListeners admits none
+	allowedFrom     gwapiv1.FromNamespaces
+	allowedSelector labels.Selector
+	// listenerSets are the ListenerSets that selected this Gateway, in attachment precedence
+	// (oldest first, then namespace/name), whether or not the Gateway admitted them
+	listenerSets []*listenerSetState
+	// reportsListenerSets is true once the Gateway configured allowedListeners or a ListenerSet
+	// selects it, so its status carries the attached count even when it is zero
+	reportsListenerSets bool
 	// status is the Gateway's status entry, completed once every route has attached
 	status *ir.GatewayStatus
 }
@@ -170,7 +195,11 @@ func (t *translator) run() (*ir.IR, *ir.Report, []Problem) {
 	if len(t.classes) == 0 {
 		return &ir.IR{}, &t.report, t.problems.List()
 	}
-	t.buildGateways()
+	claims := t.buildGateways()
+	// ListenerSets are indexed, admitted and ordered before any listener is lowered, so inline
+	// and attached listeners meet one port-claim pass in the API's merge precedence
+	t.indexListenerSets()
+	t.lowerListeners(claims)
 	t.buildRoutes()
 	t.buildStreamRoutes()
 	t.finish()
@@ -182,10 +211,17 @@ func (t *translator) finish() {
 		for _, l := range gw.listeners {
 			gw.status.Listeners[l.statusIdx].AttachedRoutes = l.attached
 		}
+		attachedSets := t.finishListenerSets(gw)
 		if gw.served {
 			gw.status.Conditions = gatewayConditions(len(gw.status.Listeners), len(gw.listeners))
 		}
+		if gw.reportsListenerSets {
+			gw.status.AttachedListenerSets = attachedSets
+		}
 		t.report.Gateways = append(t.report.Gateways, *gw.status)
+	}
+	for _, lset := range t.listenerSetOrder {
+		t.report.ListenerSets = append(t.report.ListenerSets, *lset.status)
 	}
 	for _, r := range t.routeReports {
 		t.report.Routes = append(t.report.Routes, r.status())

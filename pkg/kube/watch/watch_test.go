@@ -150,6 +150,10 @@ func TestWatcherReadsEveryKind(t *testing.T) {
 		httpRoute("shop", "web"),
 		&gwapiv1.GRPCRoute{Namespace: "shop", Name: "rpc"},
 		&gwapiv1.GatewayClass{Name: "trickster"},
+		&gwapiv1.ListenerSet{
+			Namespace: "infra", Name: "extra",
+			Spec: gwapiv1.ListenerSetSpec{ParentRef: gwapiv1.ParentGatewayReference{Name: "gw"}},
+		},
 		&gwapiv1.ReferenceGrant{
 			Namespace: "shop", Name: "grant",
 		},
@@ -186,6 +190,9 @@ func TestWatcherReadsEveryKind(t *testing.T) {
 	require.Nil(t, w.GRPCRoute("shop", "absent"))
 	require.Len(t, w.GatewayClasses(), 1)
 	require.Len(t, w.ReferenceGrants(), 1)
+	require.Len(t, w.ListenerSets(), 1)
+	require.NotNil(t, w.ListenerSet("infra", "extra"))
+	require.Nil(t, w.ListenerSet("infra", "absent"))
 
 	// results are ordered so a rebuild is deterministic
 	require.Equal(t, "infra", w.Services()[0].Namespace)
@@ -204,6 +211,7 @@ func TestWatcherSkipsUnservedGatewayKinds(t *testing.T) {
 		Namespace: "shop", Name: "tls",
 	},
 		&gwapiv1.GRPCRoute{Namespace: "shop", Name: "rpc"},
+		&gwapiv1.ListenerSet{Namespace: "infra", Name: "extra"},
 		&gwapiv1a2.TCPRoute{Namespace: "data", Name: "db"},
 		&gwapiv1a2.TLSRoute{Namespace: "data", Name: "shop"},
 		&gwapiv1a2.UDPRoute{Namespace: "data", Name: "dns"},
@@ -226,6 +234,8 @@ func TestWatcherSkipsUnservedGatewayKinds(t *testing.T) {
 	require.Empty(t, w.BackendTrafficPolicies())
 	require.Empty(t, w.GRPCRoutes())
 	require.Nil(t, w.GRPCRoute("shop", "rpc"))
+	require.Empty(t, w.ListenerSets(), "listenersets is not among the served resources")
+	require.Nil(t, w.ListenerSet("infra", "extra"))
 	require.Empty(t, w.TCPRoutes())
 	require.Nil(t, w.TCPRoute("data", "db"))
 	require.Empty(t, w.UDPRoutes())

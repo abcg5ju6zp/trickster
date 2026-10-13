@@ -35,7 +35,12 @@ import (
 type listenerState struct {
 	// name is the listener's IR identity
 	name string
-	// section is the Gateway's own name for it, which a parentRef selects
+	// owner is the object that declared the listener: the Gateway for an inline listener or the
+	// ListenerSet that attached one
+	owner ir.Source
+	// lset is the ListenerSet an attached listener belongs to, nil for an inline listener
+	lset *listenerSetState
+	// section is the declaring object's own name for it, which a parentRef selects
 	section  string
 	port     int
 	protocol string
@@ -43,8 +48,33 @@ type listenerState struct {
 	allowed  allowedRoutes
 	// attached counts the routes accepted on this listener
 	attached int
-	// statusIdx locates the listener's entry in its Gateway's status
+	// statusIdx locates the listener's entry in its Gateway's or ListenerSet's status
 	statusIdx int
+}
+
+// listenerDecl is the common shape of a Gateway Listener and a ListenerSet ListenerEntry, which
+// carry the same fields, so both are lowered through one path
+type listenerDecl struct {
+	section  string
+	port     gwapiv1.PortNumber
+	protocol gwapiv1.ProtocolType
+	hostname *gwapiv1.Hostname
+	tls      *gwapiv1.ListenerTLSConfig
+	allowed  *gwapiv1.AllowedRoutes
+}
+
+func gatewayListenerDecl(l gwapiv1.Listener) listenerDecl {
+	return listenerDecl{
+		section: string(l.Name), port: l.Port, protocol: l.Protocol,
+		hostname: l.Hostname, tls: l.TLS, allowed: l.AllowedRoutes,
+	}
+}
+
+func listenerEntryDecl(l gwapiv1.ListenerEntry) listenerDecl {
+	return listenerDecl{
+		section: string(l.Name), port: l.Port, protocol: l.Protocol,
+		hostname: l.Hostname, tls: l.TLS, allowed: l.AllowedRoutes,
+	}
 }
 
 // allowedRoutes is a listener's admission policy for routes
@@ -162,7 +192,7 @@ func gatewayConditions(total, valid int) []ir.Condition {
 	return []ir.Condition{accepted, programmed}
 }
 
-func (t *translator) buildGateways() {
+func (t *translator) buildGateways() *portClaims {
 	claims := newPortClaims()
 	for _, gw := range translate.ByAge(t.cfg.Cache.Gateways()) {
 		class := string(gw.Spec.GatewayClassName)
@@ -178,6 +208,12 @@ func (t *translator) buildGateways() {
 		// a cache policy on the Gateway is written over its class's parameters
 		state.policy, _ = t.policies.Merge(st.policy,
 			t.policies.Attach(translate.TargetGateway, gw.Namespace, gw.Name, ""))
+		if gw.Spec.AllowedListeners != nil {
+			// its status reports the attached count once the Gateway asks for ListenerSets
+			state.reportsListenerSets = true
+			state.allowedFrom, state.allowedSelector = t.listenerSetSelector(src,
+				gw.Spec.AllowedListeners)
+		}
 		t.gatewayOrder = append(t.gatewayOrder, state)
 		if !st.served {
 			// the Gateway stays claimed: its listeners are described and the routes naming it are
@@ -207,9 +243,7 @@ func (t *translator) buildGateways() {
 					gwapiv1.GatewayReasonInvalid, "the gateway is not served"),
 			}
 		}
-		if gw.Spec.AllowedListeners != nil {
-			t.reject(src, "spec.allowedListeners is not supported; ListenerSets are ignored")
-		}
+		state.inline = gw.Spec.Listeners
 		if gw.Spec.TLS != nil {
 			t.reject(src, "spec.tls is not supported and is ignored")
 		}
@@ -217,24 +251,52 @@ func (t *translator) buildGateways() {
 			t.reject(src, "spec.addresses is not supported; addresses come from "+
 				"kubernetes.published_service")
 		}
-		for _, l := range gw.Spec.Listeners {
-			if ls := t.listener(state, l, claims); ls != nil {
-				state.listeners = append(state.listeners, ls)
+		t.gateways[translate.NamespacedName(gw.Namespace, gw.Name)] = state
+	}
+	return claims
+}
+
+// lowerListeners lowers, in the Gateway API's merge precedence, every inline listener and then
+// its attached ListenerSets' entries, Gateway by Gateway oldest first; one portClaims spans the
+// pass, so an attached entry meets the same port, protocol, hostname and certificate rules as an
+// inline listener or a listener of another Gateway
+func (t *translator) lowerListeners(claims *portClaims) {
+	for _, gw := range t.gatewayOrder {
+		for _, l := range gw.inline {
+			if ls := t.gatewayListener(gw, l, claims); ls != nil {
+				gw.listeners = append(gw.listeners, ls)
 			}
 		}
-		t.gateways[translate.NamespacedName(gw.Namespace, gw.Name)] = state
+		for _, lset := range gw.listenerSets {
+			t.lowerListenerSet(lset, claims)
+		}
 	}
 }
 
-func (t *translator) listener(gw *gatewayState, l gwapiv1.Listener, claims *portClaims,
+func (t *translator) gatewayListener(gw *gatewayState, l gwapiv1.Listener, claims *portClaims,
 ) *listenerState {
 	v := newVerdict()
-	ls := t.lowerListener(gw, l, claims, v)
+	ls := t.lowerListener(gw.src, gatewayListenerDecl(l), gw.served, claims, v)
 	gw.status.Listeners = append(gw.status.Listeners, v.status(string(l.Name)))
 	if ls != nil {
 		ls.statusIdx = len(gw.status.Listeners) - 1
 	}
 	return ls
+}
+
+// lowerListenerSet lowers one attached set's entries into its status and the model; a set the
+// Gateway did not admit is still described, but its entries claim nothing and reach no route
+func (t *translator) lowerListenerSet(lset *listenerSetState, claims *portClaims) {
+	for _, e := range lset.entries {
+		v := newVerdict()
+		ls := t.lowerListener(lset.src, listenerEntryDecl(e), lset.served, claims, v)
+		lset.status.Listeners = append(lset.status.Listeners, v.status(string(e.Name)))
+		if ls != nil {
+			ls.lset = lset
+			ls.statusIdx = len(lset.status.Listeners) - 1
+			lset.listeners = append(lset.listeners, ls)
+		}
+	}
 }
 
 func (t *translator) refuseListener(v *verdict, c *ir.Condition, src ir.Source,
@@ -263,44 +325,47 @@ func transport(protocol string) string {
 	return ir.ProtocolTCP
 }
 
-func (t *translator) lowerListener(gw *gatewayState, l gwapiv1.Listener, claims *portClaims,
-	v *verdict,
+// lowerListener lowers one inline listener or ListenerSet entry. owner is the object that
+// declared it and active whether it may claim a port this pass: an unserved Gateway's listener
+// and an unadmitted ListenerSet's entry are described in status but claim nothing
+func (t *translator) lowerListener(owner ir.Source, l listenerDecl,
+	active bool, claims *portClaims, v *verdict,
 ) *listenerState {
-	src := gw.src
-	section := string(l.Name)
-	protocol, ok := listenerProtocols[l.Protocol]
+	src := owner
+	section := l.section
+	protocol, ok := listenerProtocols[l.protocol]
 	if !ok {
 		t.refuseListener(v, &v.accepted, src, gwapiv1.ListenerReasonUnsupportedProtocol,
-			"listener %q: protocol %q is not supported", section, l.Protocol)
+			"listener %q: protocol %q is not supported", section, l.protocol)
 		return nil
 	}
 	v.kinds = routeKinds[protocol]
 	var hostname string
-	if l.Hostname != nil && *l.Hostname != "" {
+	if l.hostname != nil && *l.hostname != "" {
 		if protocol == ir.ProtocolTCP || protocol == ir.ProtocolUDP {
 			// nothing in a TCP or UDP stream names a host, so a hostname cannot be honored
 			t.refuseListener(v, &v.accepted, src, gwapiv1.ListenerReasonUnsupportedValue,
-				"listener %q: a %s listener cannot have a hostname", section, l.Protocol)
+				"listener %q: a %s listener cannot have a hostname", section, l.protocol)
 			return nil
 		}
-		h, err := translate.Hostname(string(*l.Hostname), translate.HostnameRequired)
+		h, err := translate.Hostname(string(*l.hostname), translate.HostnameRequired)
 		if err != nil {
 			t.refuseListener(v, &v.accepted, src, gwapiv1.ListenerReasonUnsupportedValue,
-				"listener %q: hostname %q is not routable: %s", section, *l.Hostname, err)
+				"listener %q: hostname %q is not routable: %s", section, *l.hostname, err)
 			return nil
 		}
 		hostname = h
 	}
-	port := int(l.Port)
+	port := int(l.port)
 	portKey := transport(protocol) + ":" + strconv.Itoa(port)
-	if !gw.served {
+	if !active {
 		// described but not served: it claims no port, collects no certificate and
 		// reaches no route, so it cannot conflict with a listener that does serve
 		v.unserved()
 		return &listenerState{
-			name: src.Key() + "/" + section, section: section,
+			owner: owner, name: src.Key() + "/" + section, section: section,
 			port: port, protocol: protocol, hostname: hostname,
-			allowed: t.allowedRoutes(src, section, l.AllowedRoutes, v),
+			allowed: t.allowedRoutes(src, section, l.allowed, v),
 		}
 	}
 	if existing, ok := claims.protocols[portKey]; ok && existing != protocol {
@@ -310,8 +375,8 @@ func (t *translator) lowerListener(gw *gatewayState, l gwapiv1.Listener, claims 
 		t.reject(src, "%s", msg)
 		return nil
 	}
-	// listeners of different Gateways merge on a port, each admitting its own routes, since a port
-	// is one socket whichever declares it; a hostname repeated within one Gateway conflicts
+	// listeners of different objects merge on a port, each admitting its own routes, since a port
+	// is one socket whichever declares it; a hostname repeated within one object conflicts
 	hostKey := portKey + "|" + hostname
 	selfKey := src.Key() + "|" + hostKey
 	if _, repeated := claims.owners[selfKey]; repeated {
@@ -322,21 +387,21 @@ func (t *translator) lowerListener(gw *gatewayState, l gwapiv1.Listener, claims 
 	switch protocol {
 	case ir.ProtocolHTTPS:
 		var ok bool
-		if certs, ok = t.listenerCerts(gw, l, v); !ok {
+		if certs, ok = t.listenerCerts(owner, l, v); !ok {
 			return nil
 		}
 	case ir.ProtocolTLS:
-		if !t.passthrough(gw, l, v) {
+		if !t.passthrough(owner, l, v) {
 			return nil
 		}
 	default:
-		if l.TLS != nil {
-			t.reject(src, "listener %q: tls is ignored on a %s listener", section, l.Protocol)
+		if l.tls != nil {
+			t.reject(src, "listener %q: tls is ignored on a %s listener", section, l.protocol)
 		}
 	}
-	owner, taken := claims.owners[hostKey]
-	if taken && owner.conflicts(protocol, hostname, certs) {
-		t.hostnameConflict(v, src, section, hostname, port, owner.src)
+	claimOwner, taken := claims.owners[hostKey]
+	if taken && claimOwner.conflicts(protocol, hostname, certs) {
+		t.hostnameConflict(v, src, section, hostname, port, claimOwner.src)
 		return nil
 	}
 	// what a certificate answers for is asked of the store this listener shares, since unusable
@@ -355,9 +420,9 @@ func (t *translator) lowerListener(gw *gatewayState, l gwapiv1.Listener, claims 
 	}
 	claims.claimNames(portKey, src, section, certs, identity)
 	ls := &listenerState{
-		name: src.Key() + "/" + section, section: section,
+		owner: owner, name: src.Key() + "/" + section, section: section,
 		port: port, protocol: protocol, hostname: hostname,
-		allowed: t.allowedRoutes(src, section, l.AllowedRoutes, v),
+		allowed: t.allowedRoutes(src, section, l.allowed, v),
 	}
 	t.model.Listeners = append(t.model.Listeners, ir.Listener{
 		Name: ls.name, Section: section, Port: port, Protocol: protocol,
@@ -450,29 +515,29 @@ func (o listenerOwner) conflicts(protocol, hostname string, certs []string) bool
 	return !slices.Equal(slices.Sorted(slices.Values(o.certs)), slices.Sorted(slices.Values(certs)))
 }
 
-func (t *translator) listenerCerts(gw *gatewayState, l gwapiv1.Listener, v *verdict,
+func (t *translator) listenerCerts(owner ir.Source, l listenerDecl, v *verdict,
 ) ([]string, bool) {
 	// a listener that cannot terminate TLS is refused, an unresolved Secret is
 	// only reported
-	src := gw.src
-	section := string(l.Name)
-	if l.TLS == nil {
+	src := owner
+	section := l.section
+	if l.tls == nil {
 		t.refuseListener(v, &v.accepted, src, gwapiv1.ListenerReasonUnsupportedValue,
 			"listener %q: an HTTPS listener requires a tls block", section)
 		return nil, false
 	}
-	if l.TLS.Mode != nil && *l.TLS.Mode != gwapiv1.TLSModeTerminate {
+	if l.tls.Mode != nil && *l.tls.Mode != gwapiv1.TLSModeTerminate {
 		t.refuseListener(v, &v.accepted, src, gwapiv1.ListenerReasonUnsupportedValue,
-			"listener %q: tls mode %q is not supported", section, *l.TLS.Mode)
+			"listener %q: tls mode %q is not supported", section, *l.tls.Mode)
 		return nil, false
 	}
-	if len(l.TLS.CertificateRefs) == 0 {
+	if len(l.tls.CertificateRefs) == 0 {
 		t.refuseListener(v, &v.resolved, src, gwapiv1.ListenerReasonInvalidCertificateRef,
 			"listener %q: tls names no certificateRefs", section)
 		return nil, false
 	}
 	var out []string
-	for _, ref := range l.TLS.CertificateRefs {
+	for _, ref := range l.tls.CertificateRefs {
 		group, kind := translate.GroupOf(ref.Group), translate.KindOf(ref.Kind, kindSecret)
 		if group != "" || kind != kindSecret {
 			msg := fmt.Sprintf("listener %q: certificateRef kind %s/%s is not supported",
@@ -483,7 +548,8 @@ func (t *translator) listenerCerts(gw *gatewayState, l gwapiv1.Listener, v *verd
 		}
 		ns, name := translate.NamespaceOf(ref.Namespace, src.Namespace), string(ref.Name)
 		if ns != src.Namespace && !t.grants.permits(
-			reference{group: gwapiv1.GroupName, kind: kindGateway, namespace: src.Namespace},
+			// a ListenerSet's grants are its own: the parent Gateway's never carry over
+			reference{group: gwapiv1.GroupName, kind: src.Kind, namespace: src.Namespace},
 			reference{group: "", kind: kindSecret, namespace: ns, name: name}) {
 			msg := fmt.Sprintf("listener %q: certificateRef %s/%s is not permitted by any "+
 				"ReferenceGrant", section, ns, name)
@@ -507,16 +573,16 @@ func (t *translator) listenerCerts(gw *gatewayState, l gwapiv1.Listener, v *verd
 	return out, true
 }
 
-func (t *translator) passthrough(gw *gatewayState, l gwapiv1.Listener, v *verdict) bool {
+func (t *translator) passthrough(owner ir.Source, l listenerDecl, v *verdict) bool {
 	// a TLS listener relays the handshake to the backend, so it holds no certificate of its own
 	// and cannot terminate; the mode defaults to Terminate, which is refused rather than assumed
-	src, section := gw.src, string(l.Name)
-	if l.TLS == nil || l.TLS.Mode == nil || *l.TLS.Mode != gwapiv1.TLSModePassthrough {
+	src, section := owner, l.section
+	if l.tls == nil || l.tls.Mode == nil || *l.tls.Mode != gwapiv1.TLSModePassthrough {
 		t.refuseListener(v, &v.accepted, src, gwapiv1.ListenerReasonUnsupportedValue,
 			"listener %q: a TLS listener is served in tls mode Passthrough only", section)
 		return false
 	}
-	if len(l.TLS.CertificateRefs) > 0 {
+	if len(l.tls.CertificateRefs) > 0 {
 		t.reject(src, "listener %q: certificateRefs are ignored in tls mode Passthrough", section)
 	}
 	return true

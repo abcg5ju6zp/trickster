@@ -59,9 +59,9 @@ var (
 	errRetryAttempts       = fmt.Errorf("retry.attempts must be between 1 and %d", po.MaxRetryAttempts)
 	errRetryCode           = errors.New("retry.codes must be valid HTTP status codes")
 	errSessionType         = errors.New("sessionPersistence.type must be Cookie or Header")
-	errSessionLifetime     = errors.New("sessionPersistence.cookieConfig.lifetimeType must be Session or Permanent")
+	errSessionLifetime     = errors.New("sessionPersistence.cookie.lifetimeType must be Session or Permanent")
 	errSessionPermanent    = errors.New("a Permanent cookie requires sessionPersistence.absoluteTimeout")
-	errSessionCookieConfig = errors.New("sessionPersistence.cookieConfig requires type Cookie")
+	errSessionCookieConfig = errors.New("sessionPersistence.cookie requires type Cookie")
 )
 
 // minSessionMS is the shortest session a token can keep, as it keeps time in whole seconds
@@ -175,10 +175,18 @@ func lowerSession(in *gwapiv1.SessionPersistence) (*ir.Session, error) {
 			return nil, fmt.Errorf("%w (got %q)", errSessionType, *in.Type)
 		}
 	}
-	if in.SessionName != nil && *in.SessionName != "" {
-		out.Name = *in.SessionName
+	// v1.7 moved the token name into the type-specific config: Cookie.Name or Header.Name
+	var name string
+	switch {
+	case in.Header != nil:
+		name = string(in.Header.Name)
+	case in.Cookie != nil && in.Cookie.Name != nil:
+		name = string(*in.Cookie.Name)
+	}
+	if name != "" {
+		out.Name = name
 		if err := validSessionName(out.Type, out.Name); err != nil {
-			return nil, fmt.Errorf("sessionPersistence.sessionName %q: %w", out.Name, err)
+			return nil, fmt.Errorf("sessionPersistence name %q: %w", out.Name, err)
 		}
 	}
 	var err error
@@ -189,13 +197,13 @@ func lowerSession(in *gwapiv1.SessionPersistence) (*ir.Session, error) {
 	if out.AbsoluteMS > 0 && out.AbsoluteMS < minSessionMS {
 		out.AbsoluteMS = minSessionMS
 	}
-	if in.CookieConfig == nil || in.CookieConfig.LifetimeType == nil {
+	if in.Cookie == nil || in.Cookie.LifetimeType == nil {
 		return out, nil
 	}
 	if out.Type != ir.SessionCookie {
 		return nil, errSessionCookieConfig
 	}
-	switch *in.CookieConfig.LifetimeType {
+	switch *in.Cookie.LifetimeType {
 	case gwapiv1.SessionCookieLifetimeType:
 	case gwapiv1.PermanentCookieLifetimeType:
 		if out.AbsoluteMS == 0 {
@@ -203,7 +211,7 @@ func lowerSession(in *gwapiv1.SessionPersistence) (*ir.Session, error) {
 		}
 		out.Permanent = true
 	default:
-		return nil, fmt.Errorf("%w (got %q)", errSessionLifetime, *in.CookieConfig.LifetimeType)
+		return nil, fmt.Errorf("%w (got %q)", errSessionLifetime, *in.Cookie.LifetimeType)
 	}
 	return out, nil
 }
@@ -250,8 +258,9 @@ func lowerRetry(in *gwapiv1.HTTPRouteRetry) (*ir.RuleRetry, error) {
 		return nil, nil
 	}
 	out := &ir.RuleRetry{Attempts: 1}
-	if in.Attempts != nil {
-		out.Attempts = *in.Attempts
+	// v1.7 made attempts a plain int defaulted to 1 by the API server, so zero reads as unset
+	if in.Attempts > 0 {
+		out.Attempts = in.Attempts
 	}
 	if out.Attempts < 1 || out.Attempts > po.MaxRetryAttempts {
 		return nil, fmt.Errorf("%w (got %d)", errRetryAttempts, out.Attempts)

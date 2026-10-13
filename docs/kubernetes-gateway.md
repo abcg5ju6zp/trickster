@@ -176,11 +176,47 @@ and an `HTTPS` listener already holds its certificates before its first
 route, and the listener is `Programmed` as soon as it is declared.
 
 Not supported in this release, reported and ignored: `spec.addresses`
-(addresses come from `kubernetes.published_service`), `spec.tls`, and
-`spec.allowedListeners` (ListenerSets). A Gateway naming
-`spec.infrastructure.parametersRef` is refused with `InvalidParameters` and
-not served, since nothing reads Gateway parameters and serving it without
-them would misrepresent what was asked.
+(addresses come from `kubernetes.published_service`) and `spec.tls`. A
+Gateway naming `spec.infrastructure.parametersRef` is refused with
+`InvalidParameters` and not served, since nothing reads Gateway parameters
+and serving it without them would misrepresent what was asked.
+
+## ListenerSets
+
+A Gateway attaches additional listeners through
+[`ListenerSet`](https://gateway-api.sigs.k8s.io/api-types/listenerset/)
+objects: a namespaced resource whose `spec.parentRef` names the Gateway and
+whose `spec.listeners` use the same `ListenerEntry` fields as inline
+listeners (protocol, port, hostname, `tls`, `allowedRoutes`). By default a
+Gateway admits none; `spec.allowedListeners.namespaces.from` selects
+attaching namespaces with `Same` (the default when set), `All`, or
+`Selector` against Namespace labels.
+
+Attached listeners are merged with the inline ones in the API's precedence
+— parent Gateway first, then ListenerSets oldest first, then namespace/name —
+and meet the exact same port, protocol, hostname, certificate and route-kind
+checks as inline listeners. A conflicting entry is refused on its own with
+`ProtocolConflict` or `HostnameConflict`; its siblings and the Gateway's
+inline listeners keep serving.
+
+- A route names its **direct parent** in `parentRef`: `kind: ListenerSet`
+  attaches only to that set's entries (optionally narrowed with
+  `sectionName`/`port`), and a Gateway `parentRef` only to the inline
+  listeners; reaching both takes two `parentRefs`. The entry's
+  `allowedRoutes` decides admission, with the ListenerSet's own namespace
+  standing in for the Gateway's under `Same`.
+- The ListenerSet's TLS `certificateRefs` need their own cross-namespace
+  `ReferenceGrant`; grants naming the Gateway do not carry over.
+- The Gateway reports the number of accepted sets in
+  `status.attachedListenerSets`; each ListenerSet reports `Accepted` and
+  `Programmed` with per-entry listener status. A set not selected by
+  `allowedListeners` is `NotAllowed`, one naming an unserved parent Gateway
+  `ParentNotAccepted`, and one whose entries all fail
+  `ListenersNotValid`.
+- Adding, changing or deleting a ListenerSet, or changing a Secret,
+  Namespace or route it depends on, triggers one whole-world rebuild: the
+  published overlay always contains every listener of one snapshot or the
+  previous one, so a rejected change never exposes half a listener set.
 
 Binding a port below 1024 inside a container requires running as root,
 granting `NET_BIND_SERVICE`, or the `net.ipv4.ip_unprivileged_port_start`

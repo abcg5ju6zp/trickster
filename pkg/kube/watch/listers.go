@@ -92,6 +92,17 @@ func (w *Watcher) Gateways() []*gwapiv1.Gateway {
 	})
 }
 
+// ListenerSets returns every ListenerSet in scope, or nothing in a cluster that does not serve
+// the kind
+func (w *Watcher) ListenerSets() []*gwapiv1.ListenerSet {
+	return collect(w, func(s *scope) ([]*gwapiv1.ListenerSet, error) {
+		if s.listenerSets == nil {
+			return nil, nil
+		}
+		return s.listenerSets.List(labels.Everything())
+	})
+}
+
 // HTTPRoutes returns every HTTPRoute in scope
 func (w *Watcher) HTTPRoutes() []*gwapiv1.HTTPRoute {
 	return collect(w, func(s *scope) ([]*gwapiv1.HTTPRoute, error) {
@@ -338,6 +349,17 @@ func (w *Watcher) Gateway(namespace, name string) *gwapiv1.Gateway {
 			return nil, errNoLister
 		}
 		return s.gateways.Gateways(namespace).Get(name)
+	})
+}
+
+// ListenerSet returns one ListenerSet from cache, or nil when it is absent, out of scope, or the
+// cluster does not serve the kind
+func (w *Watcher) ListenerSet(namespace, name string) *gwapiv1.ListenerSet {
+	return lookup(w, namespace, func(s *scope) (*gwapiv1.ListenerSet, error) {
+		if s.listenerSets == nil {
+			return nil, errNoLister
+		}
+		return s.listenerSets.ListenerSets(namespace).Get(name)
 	})
 }
 

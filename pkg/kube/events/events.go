@@ -208,8 +208,8 @@ func (s *termSink) Patch(e *corev1.Event, data []byte) (*corev1.Event, error) {
 func Reference(src ir.Source) *corev1.ObjectReference {
 	var apiVersion string
 	switch src.Kind {
-	case ir.KindGateway, ir.KindGatewayClass, ir.KindHTTPRoute, ir.KindGRPCRoute,
-		ir.KindBackendTLSPolicy:
+	case ir.KindGateway, ir.KindGatewayClass, ir.KindListenerSet, ir.KindHTTPRoute,
+		ir.KindGRPCRoute, ir.KindBackendTLSPolicy:
 		apiVersion = gwapiv1.GroupVersion.String()
 	case ir.KindTCPRoute, ir.KindTLSRoute, ir.KindUDPRoute:
 		apiVersion = gwapiv1a2.GroupVersion.String()

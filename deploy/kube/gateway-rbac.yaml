@@ -18,7 +18,7 @@ rules:
   # Gateway API: only needed where the cluster serves the group; the
   # controller probes for it at startup and the grants are harmless without it
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses", "gateways", "httproutes", "grpcroutes", "tcproutes", "tlsroutes", "udproutes"]
+    resources: ["gatewayclasses", "gateways", "listenersets", "httproutes", "grpcroutes", "tcproutes", "tlsroutes", "udproutes"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["referencegrants", "backendtlspolicies"]
@@ -32,6 +32,7 @@ rules:
     resources:
       - gatewayclasses/status
       - gateways/status
+      - listenersets/status
       - httproutes/status
       - grpcroutes/status
       - tcproutes/status

@@ -66,6 +66,18 @@ type GatewayStatus struct {
 	Conditions []Condition `json:"conditions,omitempty"`
 	// Listeners carries one entry per listener the Gateway declared, in declaration order
 	Listeners []ListenerStatus `json:"listeners,omitempty"`
+	// AttachedListenerSets is the number of ListenerSets the Gateway accepted; it is reported
+	// only once the Gateway names one in allowedListeners or one attaches to it
+	AttachedListenerSets int `json:"attached_listener_sets,omitempty"`
+}
+
+// ListenerSetStatus is what is written back to a ListenerSet attached to a claimed Gateway
+type ListenerSetStatus struct {
+	Source Source `json:"source"`
+	// Conditions are Accepted and Programmed
+	Conditions []Condition `json:"conditions,omitempty"`
+	// Listeners carries one entry per listener the ListenerSet declared, in declaration order
+	Listeners []ListenerStatus `json:"listeners,omitempty"`
 }
 
 // ParentRef identifies one parentRef of a route as the route declared it,
@@ -111,7 +123,9 @@ type PolicyStatus struct {
 type Report struct {
 	Classes  []ClassStatus   `json:"classes,omitempty"`
 	Gateways []GatewayStatus `json:"gateways,omitempty"`
-	Routes   []RouteStatus   `json:"routes,omitempty"`
+	// ListenerSets are the ListenerSets attached to a claimed Gateway, accepted or not
+	ListenerSets []ListenerSetStatus `json:"listener_sets,omitempty"`
+	Routes       []RouteStatus       `json:"routes,omitempty"`
 	// Ingresses are the claimed Ingress objects, whose status carries only
 	// the published addresses
 	Ingresses []Source `json:"ingresses,omitempty"`
@@ -128,18 +142,20 @@ func (r *Report) Merge(o *Report) *Report {
 		return r
 	}
 	return &Report{
-		Classes:   append(slices.Clone(r.Classes), o.Classes...),
-		Gateways:  append(slices.Clone(r.Gateways), o.Gateways...),
-		Routes:    append(slices.Clone(r.Routes), o.Routes...),
-		Ingresses: append(slices.Clone(r.Ingresses), o.Ingresses...),
-		Policies:  append(slices.Clone(r.Policies), o.Policies...),
+		Classes:      append(slices.Clone(r.Classes), o.Classes...),
+		Gateways:     append(slices.Clone(r.Gateways), o.Gateways...),
+		ListenerSets: append(slices.Clone(r.ListenerSets), o.ListenerSets...),
+		Routes:       append(slices.Clone(r.Routes), o.Routes...),
+		Ingresses:    append(slices.Clone(r.Ingresses), o.Ingresses...),
+		Policies:     append(slices.Clone(r.Policies), o.Policies...),
 	}
 }
 
 // IsEmpty reports whether the report names no object at all
 func (r *Report) IsEmpty() bool {
 	return r == nil || (len(r.Classes) == 0 && len(r.Gateways) == 0 &&
-		len(r.Routes) == 0 && len(r.Ingresses) == 0 && len(r.Policies) == 0)
+		len(r.ListenerSets) == 0 && len(r.Routes) == 0 && len(r.Ingresses) == 0 &&
+		len(r.Policies) == 0)
 }
 
 // Find returns the condition of the given type, and false when there is none

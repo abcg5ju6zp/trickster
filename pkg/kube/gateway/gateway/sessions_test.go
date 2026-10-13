@@ -75,7 +75,7 @@ func memberSession(m *ir.IR, src string) *ir.Session {
 
 func TestTranslateSessionPersistence(t *testing.T) {
 	problems := golden(t, sessionsFixture, endpointRouting)
-	containing(t, problems, shopRoute, "rule 3", "cookieConfig requires type Cookie; sessions are not kept")
+	containing(t, problems, shopRoute, "rule 3", "cookie requires type Cookie; sessions are not kept")
 	containing(t, problems, "HTTPRoute/shop/younger",
 		`session cookie "shop" is already set for this host by HTTPRoute/shop/shop rule 0`)
 	containing(t, problems, laterPolicy,
@@ -118,28 +118,39 @@ func TestTranslateSessionsInServiceRouting(t *testing.T) {
 func TestLowerSession(t *testing.T) {
 	cookie, header := gwapiv1.CookieBasedSessionPersistence, gwapiv1.HeaderBasedSessionPersistence
 	permanent, session := gwapiv1.PermanentCookieLifetimeType, gwapiv1.SessionCookieLifetimeType
-	name := func(s string) *string { return &s }
+	cookieName := func(s string) *gwapiv1.CookieName { v := gwapiv1.CookieName(s); return &v }
 	d := func(s string) *gwapiv1.Duration { v := gwapiv1.Duration(s); return &v }
 	for label, test := range map[string]struct {
 		in   gwapiv1.SessionPersistence
 		want *ir.Session
 		err  string
 	}{
-		"defaults":         {gwapiv1.SessionPersistence{}, &ir.Session{Type: ir.SessionCookie}, ""},
-		"sub-second":       {gwapiv1.SessionPersistence{AbsoluteTimeout: d("10ms")}, &ir.Session{Type: ir.SessionCookie, AbsoluteMS: 1000}, ""},
-		"session lifetime": {gwapiv1.SessionPersistence{Type: &cookie, CookieConfig: &gwapiv1.CookieConfig{LifetimeType: &session}}, &ir.Session{Type: ir.SessionCookie}, ""},
-		"secure prefix":    {gwapiv1.SessionPersistence{SessionName: name("__Host-s")}, &ir.Session{Type: ir.SessionCookie, Name: "__Host-s"}, ""},
-		"header":           {gwapiv1.SessionPersistence{Type: &header, SessionName: name("X-S")}, &ir.Session{Type: ir.SessionHeader, Name: "X-S"}, ""},
-		"bad type":         {gwapiv1.SessionPersistence{Type: new(gwapiv1.SessionPersistenceType("Query"))}, nil, "must be Cookie or Header"},
-		"bad cookie name":  {gwapiv1.SessionPersistence{SessionName: name("a b")}, nil, `sessionName "a b"`},
-		"bad header name":  {gwapiv1.SessionPersistence{Type: &header, SessionName: name("X S")}, nil, `sessionName "X S"`},
+		"defaults":   {gwapiv1.SessionPersistence{}, &ir.Session{Type: ir.SessionCookie}, ""},
+		"sub-second": {gwapiv1.SessionPersistence{AbsoluteTimeout: d("10ms")}, &ir.Session{Type: ir.SessionCookie, AbsoluteMS: 1000}, ""},
+		"session lifetime": {gwapiv1.SessionPersistence{
+			Type:   &cookie,
+			Cookie: &gwapiv1.CookieConfig{LifetimeType: &session},
+		}, &ir.Session{Type: ir.SessionCookie}, ""},
+		"secure prefix": {gwapiv1.SessionPersistence{
+			Cookie: &gwapiv1.CookieConfig{Name: cookieName("__Host-s")},
+		}, &ir.Session{Type: ir.SessionCookie, Name: "__Host-s"}, ""},
+		"header": {gwapiv1.SessionPersistence{
+			Type:   &header,
+			Header: &gwapiv1.HeaderConfig{Name: gwapiv1.HeaderName("X-S")},
+		}, &ir.Session{Type: ir.SessionHeader, Name: "X-S"}, ""},
+		"bad type":        {gwapiv1.SessionPersistence{Type: new(gwapiv1.SessionPersistenceType("Query"))}, nil, "must be Cookie or Header"},
+		"bad cookie name": {gwapiv1.SessionPersistence{Cookie: &gwapiv1.CookieConfig{Name: cookieName("a b")}}, nil, `sessionPersistence name "a b"`},
+		"bad header name": {gwapiv1.SessionPersistence{
+			Type:   &header,
+			Header: &gwapiv1.HeaderConfig{Name: gwapiv1.HeaderName("X S")},
+		}, nil, `sessionPersistence name "X S"`},
 		"bad timeout":      {gwapiv1.SessionPersistence{AbsoluteTimeout: d("soon")}, nil, "absoluteTimeout"},
 		"permanent, no timeout": {
-			gwapiv1.SessionPersistence{CookieConfig: &gwapiv1.CookieConfig{LifetimeType: &permanent}},
+			gwapiv1.SessionPersistence{Cookie: &gwapiv1.CookieConfig{LifetimeType: &permanent}},
 			nil,
 			"requires sessionPersistence.absoluteTimeout",
 		},
-		"bad lifetime": {gwapiv1.SessionPersistence{CookieConfig: &gwapiv1.CookieConfig{
+		"bad lifetime": {gwapiv1.SessionPersistence{Cookie: &gwapiv1.CookieConfig{
 			LifetimeType: new(gwapiv1.CookieLifetimeType("Forever")),
 		}}, nil, "must be Session or Permanent"},
 	} {
@@ -160,8 +171,8 @@ func TestTranslateServiceSessions(t *testing.T) {
 	// a Service's session gives way to its rule's own, and a Service's named cookie is subject to
 	// the same one-owner-per-host rule as a rule's
 	c := load(t, filepath.Join("testdata", sessionsFixture+".yaml"))
-	carts := "carts"
-	c.traffic[0].Spec.SessionPersistence.SessionName = &carts
+	carts := gwapiv1.CookieName("carts")
+	c.traffic[0].Spec.SessionPersistence.Cookie = &gwapiv1.CookieConfig{Name: &carts}
 	c.traffic[1].Spec.SessionPersistence.Type = new(gwapiv1.SessionPersistenceType("Query"))
 	c.routes[0].Spec.Rules[1].BackendRefs[0].Name = gwapiv1.ObjectName(carts)
 	c.routes[1].Spec.Rules[0].BackendRefs[0].Name = gwapiv1.ObjectName(carts)
@@ -307,8 +318,8 @@ func TestSessionsLoadInEndpointRouting(t *testing.T) {
 	// a Service's named cookie reached through weighted routes on disjoint hosts is set by ALBs
 	// with no hosts of their own, which validation reads from the routes that reach them
 	c := load(t, filepath.Join("testdata", sessionsFixture+".yaml"))
-	carts := "carts"
-	c.traffic[0].Spec.SessionPersistence.SessionName = &carts
+	carts := gwapiv1.CookieName("carts")
+	c.traffic[0].Spec.SessionPersistence.Cookie = &gwapiv1.CookieConfig{Name: &carts}
 	for _, hr := range c.routes[1:] {
 		// younger (b.example.com) and elsewhere (c.example.com), each a Service pair
 		hr.Spec.Rules[0].BackendRefs[1].Name = gwapiv1.ObjectName(carts)

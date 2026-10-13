@@ -79,10 +79,10 @@ spec:
         - name: b
           port: 8080
       sessionPersistence:
-        sessionName: shop
         type: Cookie
         absoluteTimeout: 1h
-        cookieConfig:
+        cookie:
+          name: shop
           lifetimeType: Permanent
     - matches:
         - path:
@@ -92,8 +92,9 @@ spec:
         - name: a
           port: 8080
       sessionPersistence:
-        sessionName: X-Session
         type: Header
+        header:
+          name: X-Session
     - matches:
         - path:
             type: PathPrefix
@@ -110,7 +111,7 @@ spec:
           port: 8080
       sessionPersistence:
         type: Header
-        cookieConfig:
+        cookie:
           lifetimeType: Session
 ---
 # a younger route setting the same cookie for one of the same hosts, which
@@ -137,7 +138,8 @@ spec:
         - name: b
           port: 8080
       sessionPersistence:
-        sessionName: shop
+        cookie:
+          name: shop
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -157,7 +159,8 @@ spec:
         - name: b
           port: 8080
       sessionPersistence:
-        sessionName: shop
+        cookie:
+          name: shop
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GRPCRoute

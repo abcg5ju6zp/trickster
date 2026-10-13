@@ -100,21 +100,22 @@ var decoder = func() runtime.Decoder {
 
 // cache is a Cache built from decoded fixture objects
 type cache struct {
-	classes    []*gwapiv1.GatewayClass
-	gateways   []*gwapiv1.Gateway
-	routes     []*gwapiv1.HTTPRoute
-	grpcRoutes []*gwapiv1.GRPCRoute
-	tcpRoutes  []*gwapiv1a2.TCPRoute
-	tlsRoutes  []*gwapiv1a2.TLSRoute
-	udpRoutes  []*gwapiv1a2.UDPRoute
-	grants     []*gwapiv1.ReferenceGrant
-	policies   []*gwapiv1.BackendTLSPolicy
-	traffic    []*gwapix.XBackendTrafficPolicy
-	cachePols  []*cachepolicy.CachePolicy
-	services   map[string]*corev1.Service
-	secrets    map[string]*corev1.Secret
-	configMaps map[string]*corev1.ConfigMap
-	namespaces map[string]*corev1.Namespace
+	classes      []*gwapiv1.GatewayClass
+	gateways     []*gwapiv1.Gateway
+	listenerSets []*gwapiv1.ListenerSet
+	routes       []*gwapiv1.HTTPRoute
+	grpcRoutes   []*gwapiv1.GRPCRoute
+	tcpRoutes    []*gwapiv1a2.TCPRoute
+	tlsRoutes    []*gwapiv1a2.TLSRoute
+	udpRoutes    []*gwapiv1a2.UDPRoute
+	grants       []*gwapiv1.ReferenceGrant
+	policies     []*gwapiv1.BackendTLSPolicy
+	traffic      []*gwapix.XBackendTrafficPolicy
+	cachePols    []*cachepolicy.CachePolicy
+	services     map[string]*corev1.Service
+	secrets      map[string]*corev1.Secret
+	configMaps   map[string]*corev1.ConfigMap
+	namespaces   map[string]*corev1.Namespace
 }
 
 func newCache() *cache {
@@ -128,6 +129,15 @@ func newCache() *cache {
 
 func (c *cache) GatewayClasses() []*gwapiv1.GatewayClass    { return c.classes }
 func (c *cache) Gateways() []*gwapiv1.Gateway               { return c.gateways }
+func (c *cache) ListenerSets() []*gwapiv1.ListenerSet { return c.listenerSets }
+func (c *cache) ListenerSet(ns, name string) *gwapiv1.ListenerSet {
+	for _, l := range c.listenerSets {
+		if l.Namespace == ns && l.Name == name {
+			return l
+		}
+	}
+	return nil
+}
 func (c *cache) HTTPRoutes() []*gwapiv1.HTTPRoute           { return c.routes }
 func (c *cache) GRPCRoutes() []*gwapiv1.GRPCRoute           { return c.grpcRoutes }
 func (c *cache) TCPRoutes() []*gwapiv1a2.TCPRoute           { return c.tcpRoutes }
@@ -256,6 +266,8 @@ func load(t *testing.T, path string) *cache {
 			c.classes = append(c.classes, o)
 		case *gwapiv1.Gateway:
 			c.gateways = append(c.gateways, o)
+		case *gwapiv1.ListenerSet:
+			c.listenerSets = append(c.listenerSets, o)
 		case *gwapiv1.HTTPRoute:
 			c.routes = append(c.routes, o)
 		case *gwapiv1.GRPCRoute:
@@ -2028,7 +2040,12 @@ func TestTranslateGatewayRejections(t *testing.T) {
 	model, _, problems := Translate(Config{
 		Cache: c, Claimer: class.New(controllerName, ""), Options: options(t),
 	})
-	containing(t, problems, "allowedListeners is not supported")
+	// allowedListeners is honored now: an empty policy admits no ListenerSet, but with none in
+	// cache it is otherwise silent
+	require.NotEmpty(t, problems)
+	for _, p := range problems {
+		require.NotContains(t, p.Detail, "allowedListeners is not supported")
+	}
 	containing(t, problems, "spec.tls is not supported")
 	containing(t, problems, "spec.addresses is not supported")
 	containing(t, problems, `listener "bad-host"`, "is not routable")
@@ -2871,8 +2888,7 @@ func TestTranslateTimeoutsAndRetry(t *testing.T) {
 			r.Timeouts = &gwapiv1.HTTPRouteTimeouts{Request: &d}
 		}, "timeouts.request: not a valid duration"},
 		{"too many attempts", func(r *gwapiv1.HTTPRouteRule) {
-			n := 99
-			r.Retry = &gwapiv1.HTTPRouteRetry{Attempts: &n}
+			r.Retry = &gwapiv1.HTTPRouteRetry{Attempts: 99}
 		}, "retry.attempts must be between 1 and"},
 		{"bad code", func(r *gwapiv1.HTTPRouteRule) {
 			r.Retry = &gwapiv1.HTTPRouteRetry{Codes: []gwapiv1.HTTPRouteRetryStatusCode{42}}
