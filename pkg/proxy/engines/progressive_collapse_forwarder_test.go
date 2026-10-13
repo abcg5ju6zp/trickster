@@ -18,12 +18,16 @@ package engines
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	perrs "github.com/trickstercache/trickster/v2/pkg/proxy/errors"
 )
 
 var testString = "Hey, I'm an http response body string."
@@ -397,6 +401,78 @@ func TestPCFWaitAllCompleteRace(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("iteration %d: WaitAllComplete deadlocked", i)
 		}
+	}
+}
+
+// TestPCFClientCancellationIsLocal verifies that cancelling one waiting
+// client removes only its own relation: it unblocks promptly with the context
+// error, neither fails the owner's stream nor stops any other client from
+// receiving the complete byte sequence.
+func TestPCFClientCancellationIsLocal(t *testing.T) {
+	resp := &http.Response{}
+	pcf := NewPCF(resp, -1, int64(HTTPBlockSize*4)).(*progressiveCollapseForwarder)
+	pcf.Write([]byte("partial"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- pcf.AddClientContext(ctx, io.Discard)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for pcf.clientCount.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("cancelling client never registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled for the gone client, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled client stayed blocked on the shared stream")
+	}
+
+	// owner finishes the object; the round must not inherit the cancellation
+	if _, err := pcf.Write([]byte("-complete")); err != nil {
+		t.Fatal(err)
+	}
+	pcf.Close()
+	var w bytes.Buffer
+	if err := pcf.AddClient(&w); err != nil {
+		t.Fatalf("a later client must still receive the full object, got %v", err)
+	}
+	if w.String() != "partial-complete" {
+		t.Fatalf("unexpected body %q", w.String())
+	}
+	body, err := pcf.GetBody()
+	if err != nil || string(body) != "partial-complete" {
+		t.Fatalf("GetBody after local cancel: %q, %v", body, err)
+	}
+}
+
+// TestPCFTerminalOutcomeWinsOnce verifies the round publishes a single
+// distinguishable conclusion: after a failure, a late Close cannot turn it
+// into success (which would hand incomplete bytes to GetBody/late clients).
+func TestPCFTerminalOutcomeWinsOnce(t *testing.T) {
+	resp := &http.Response{}
+	pcf := NewPCF(resp, -1, int64(HTTPBlockSize*4))
+	pcf.Write([]byte("partial"))
+	pcf.CloseWithError(io.ErrUnexpectedEOF)
+	pcf.Close()
+	pcf.CloseWithError(perrs.ErrCollapseClosing)
+
+	var w bytes.Buffer
+	if err := pcf.AddClient(&w); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected first terminal error to win, got %v", err)
+	}
+	if w.String() != "partial" {
+		t.Fatalf("committed chunks still fan out, got %q", w.String())
+	}
+	if _, err := pcf.GetBody(); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("incomplete bytes must not be reusable via GetBody, got %v", err)
 	}
 }
 

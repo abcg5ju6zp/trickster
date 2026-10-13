@@ -197,6 +197,17 @@ func passthroughModifyResponse(resp *http.Response) error {
 		InvalidateTargetURI(r)
 	}
 
+	// a progressive collapse owner needs the authoritative upstream read
+	// outcome (clean EOF vs mid-body interruption), which ReverseProxy only
+	// logs after headers are committed. The tracker rides the detached owner
+	// request context; ordinary passthrough requests carry none. It wraps last
+	// so any configured response-body replacement is what actually gets read.
+	if r != nil && resp.Body != nil {
+		if tracker := collapseTrackerFromContext(r.Context()); tracker != nil {
+			resp.Body = tracker.track(resp.Body, resp.ContentLength)
+		}
+	}
+
 	setStatusHeader(resp.StatusCode, resp.Header)
 	// matches the request-side strip in AddForwardingHeaders; ReverseProxy's
 	// own hop-header removal does not cover Accept-Encoding. It runs before

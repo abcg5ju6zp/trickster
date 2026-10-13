@@ -444,13 +444,15 @@ func handlePCF(pr *proxyRequest) error {
 	pcfResult, pcfExists := reqs.Load(pr.key)
 	// a PCF session is in progress for this URL, join this client to it.
 	if pcfExists {
-		pcf := pcfResult.(ProgressiveCollapseForwarder)
+		pcf := pcfResult.(*pcfSession).pcf
 		pr.upstreamResponse = pcf.GetResp()
 		pr.mapLock.Lock()
 		pr.responseWriter = PrepareResponseWriter(pr.responseWriter, pr.upstreamResponse.StatusCode,
 			pr.upstreamResponse.Header, nil)
 		pr.mapLock.Unlock()
-		if err := pcf.AddClient(pr.responseWriter); err != nil {
+		// client cancellation ends only this joiner's wait; it never cancels
+		// the owner fetch the other joiners still read from
+		if err := pcf.AddClientContext(pr.Request.Context(), pr.responseWriter); err != nil {
 			abortOnCopyError(pr.responseWriter, pr.Request, err)
 			return err
 		}
@@ -482,17 +484,28 @@ func handlePCF(pr *proxyRequest) error {
 	pr.writeResponseHeader()
 	pr.responseWriter = PrepareResponseWriter(pr.responseWriter, resp.StatusCode, resp.Header, nil)
 	{
-		actual, loaded := reqs.LoadOrStore(pr.key, pcf)
+		// the session binds the published PCF to THIS owner fetch's body, so
+		// shutdown can interrupt the upstream read independently of whether a
+		// client is still attached
+		sess := &pcfSession{
+			pcf: pcf,
+			closeBody: func() {
+				if reader != nil {
+					_ = reader.Close()
+				}
+			},
+		}
+		actual, loaded := reqs.LoadOrStore(pr.key, sess)
 		if loaded {
 			// Another goroutine created a PCF session first; join it instead.
 			resp.Body.Close()
-			existingPCF := actual.(ProgressiveCollapseForwarder)
+			existingPCF := actual.(*pcfSession).pcf
 			pr.upstreamResponse = existingPCF.GetResp()
 			pr.mapLock.Lock()
 			pr.responseWriter = PrepareResponseWriter(pr.responseWriter, pr.upstreamResponse.StatusCode,
 				pr.upstreamResponse.Header, nil)
 			pr.mapLock.Unlock()
-			if err := existingPCF.AddClient(pr.responseWriter); err != nil {
+			if err := existingPCF.AddClientContext(pr.Request.Context(), pr.responseWriter); err != nil {
 				abortOnCopyError(pr.responseWriter, pr.Request, err)
 				return err
 			}
@@ -509,7 +522,9 @@ func handlePCF(pr *proxyRequest) error {
 					reader.Close()
 				}
 			}()
-			defer reqs.Delete(pr.key)
+			// identity-guarded: a late copy pump for a dead session cannot
+			// remove a successor round's registration
+			defer reqs.CompareAndDelete(pr.key, sess)
 			var dest io.Writer = pcf
 			if pr.writeToCache {
 				pr.cacheBuffer = pr.newCacheBuffer(contentLength)
@@ -532,13 +547,61 @@ func handlePCF(pr *proxyRequest) error {
 			}
 		})
 
-		if err := pcf.AddClient(pr.responseWriter); err != nil {
+		if err := pcf.AddClientContext(pr.Request.Context(), pr.responseWriter); err != nil {
 			abortOnCopyError(pr.responseWriter, pr.Request, err)
 			return err
 		}
 
 		return handleAllWrites(pr)
 	}
+}
+
+// pcfSession is one registered round in the caching lane's PCF registry. It
+// pairs the shared forwarder with a closer for its owner's upstream body, so
+// shutdown reclaims the body and fails the stream in one distinguishable step.
+type pcfSession struct {
+	pcf       ProgressiveCollapseForwarder
+	closeBody func()
+}
+
+// joinPCFClient binds a joiner in the non-caching HTTP proxy lane to an
+// existing collapse round: the owner's status/headers and the owner's byte
+// sequence. This client's cancellation ends only its own read, and any other
+// terminal error breaks the connection rather than framing a partial body.
+// *resp is reassigned to the shared response so downstream accounting reports
+// what the joiner actually received.
+func joinPCFClient(pcf ProgressiveCollapseForwarder, w io.Writer, r *http.Request,
+	resp **http.Response,
+) error {
+	joined := pcf.GetResp()
+	writer := PrepareResponseWriter(w, joined.StatusCode, joined.Header, nil)
+	err := pcf.AddClientContext(r.Context(), streamWriter(writer, joined))
+	if resp != nil {
+		*resp = joined
+	}
+	if err != nil {
+		abortOnCopyError(writer, r, err)
+		return err
+	}
+	return nil
+}
+
+// shutdownPCFSessions fails every in-flight caching-lane collapse and closes
+// its owner body during service shutdown. A blocked joiner receives the
+// shutdown error instead of a clean EOF, and the detached upstream read cannot
+// outlive the draining listener.
+func shutdownPCFSessions() {
+	reqs.Range(func(_, value any) bool {
+		sess, ok := value.(*pcfSession)
+		if !ok {
+			return true
+		}
+		sess.pcf.CloseWithError(errors.ErrCollapseClosing)
+		if sess.closeBody != nil {
+			sess.closeBody()
+		}
+		return true
+	})
 }
 
 // serveUncollapsed serves a response that reached the collapse path but cannot
@@ -665,12 +728,12 @@ func fetchViaObjectProxyCache(w io.Writer, r *http.Request) (*http.Response, sta
 			tspan.SetAttributes(rsc.Tracer, span, attribute.String("cache.status", status.LookupStatusProxyOnly.String()))
 			return nil, status.LookupStatusProxyOnly
 		}
-		pcf := pcfResult.(ProgressiveCollapseForwarder)
+		pcf := pcfResult.(*pcfSession).pcf
 		pr.upstreamResponse = pcf.GetResp()
 		pr.mapLock.Lock()
 		writer := PrepareResponseWriter(w, pr.upstreamResponse.StatusCode, pr.upstreamResponse.Header, nil)
 		pr.mapLock.Unlock()
-		if err := pcf.AddClient(writer); err != nil {
+		if err := pcf.AddClientContext(r.Context(), writer); err != nil {
 			tspan.SetAttributes(rsc.Tracer, span, attribute.String("cache.status", status.LookupStatusError.String()))
 			abortOnCopyError(writer, r, err)
 			return nil, status.LookupStatusError

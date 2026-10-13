@@ -40,6 +40,7 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging"
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging/logger"
 	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
+	"github.com/trickstercache/trickster/v2/pkg/proxy/engines"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/handlers/trickster/ready"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/listener"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/tls/acme"
@@ -189,6 +190,11 @@ func shutdown(si *instance.ServerInstance, quiesced <-chan struct{}) {
 		case <-ctx.Done():
 		}
 	}
+	// Reclaim in-flight progressive collapses before draining listeners:
+	// detached owner fetches are cancelled, their bodies closed and blocked
+	// joiners released, so the drain does not wait on (or leak goroutines
+	// blocked behind) upstream reads nobody is listening to anymore.
+	engines.CloseInFlightCollapses()
 	if err := si.Listeners.ShutdownContext(ctx); err != nil {
 		logger.Warn("shutdown drain ended early; remaining connections were closed",
 			logging.Pairs{keys.Error: err.Error()})

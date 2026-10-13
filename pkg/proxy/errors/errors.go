@@ -82,6 +82,21 @@ var ErrOriginStalled = errors.New("origin stalled mid-response")
 // the configured max object size and the collapse was aborted
 var ErrPCFMaxSizeExceeded = errors.New("collapsed response exceeded max object size")
 
+// ErrCollapseAbandoned indicates a collapse round was reclaimed while its
+// upstream fetch was still in flight because every client bound to it had left.
+// Its partial bytes are not reusable; the next request for the key fetches anew.
+var ErrCollapseAbandoned = errors.New("collapsed request abandoned by all clients")
+
+// ErrCollapseClosing indicates a collapse round was torn down because the
+// server is shutting down. Attached clients observe it in place of a clean EOF
+// so a drained connection is never mistaken for a complete object.
+var ErrCollapseClosing = errors.New("collapsed request interrupted by server shutdown")
+
+// ErrCollapseFailedBeforeHeaders indicates the collapse owner's upstream fetch
+// ended before response headers were committed, so no shared response exists
+// and waiting clients must conclude the round independently.
+var ErrCollapseFailedBeforeHeaders = errors.New("collapsed upstream failed before response headers")
+
 // ErrUnsupportedEncoding indicates that the client requested an encoding that is not supported by Trickster
 var ErrUnsupportedEncoding = errors.New("unsupported ecoding format requested")
 

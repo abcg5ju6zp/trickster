@@ -106,17 +106,14 @@ func DoProxy(w io.Writer, r *http.Request, closeResponse bool) *http.Response {
 	} else {
 		pr := newProxyRequest(r, w)
 		key := ComposeCacheKey(o.Name, o.CacheKeyPrefix, "", pr.DeriveCacheKey(""))
-		result, ok := reqs.Load(key)
-		if !ok {
+		result, exists := reqs.Load(key)
+		if !exists {
 			var contentLength int64
 			// the fetch is detached from this client's cancellation so a leader
 			// disconnect does not tear down the stream for joined followers
 			lr := r.WithContext(context.WithoutCancel(r.Context()))
 			reader, resp, contentLength = PrepareFetchReader(lr)
 			cacheStatusCode = setStatusHeader(resp.StatusCode, resp.Header)
-			pr.mapLock.Lock()
-			writer := PrepareResponseWriter(w, resp.StatusCode, resp.Header, nil)
-			pr.mapLock.Unlock()
 			var pcf ProgressiveCollapseForwarder
 			if (contentLength < 0 || (contentLength > 0 &&
 				contentLength < int64(o.MaxObjectSizeBytes))) &&
@@ -124,55 +121,83 @@ func DoProxy(w io.Writer, r *http.Request, closeResponse bool) *http.Response {
 				pcf = NewPCF(resp, contentLength, int64(o.MaxObjectSizeBytes))
 			}
 			if pcf != nil {
-				reqs.Store(key, pcf)
-				// Blocks until server completes
-				grClose := reader != nil && closeResponse
-				closeResponse = false
-				goWithRecover("doproxy.pcf.copy", func() {
-					defer func() {
-						if grClose {
-							reader.Close()
+				// one atomic owner election: the loser of a concurrent miss
+				// discards its own fetch and binds to the winner's stream
+				ownerReader := reader
+				sess := &pcfSession{
+					pcf: pcf,
+					closeBody: func() {
+						if ownerReader != nil {
+							_ = ownerReader.Close()
 						}
-					}()
-					defer reqs.Delete(key)
-					n, err := tbytes.Copy(pcf, reader)
-					switch {
-					case err != nil:
-						logger.Error("pcf upstream copy failed",
-							logging.Pairs{keys.Error: err.Error()})
-						pcf.CloseWithError(err)
-					case r.Method != http.MethodHead && contentLength > 0 && n < contentLength:
-						logger.Error("pcf upstream returned short body",
-							logging.Pairs{keys.Key: key})
-						pcf.CloseWithError(io.ErrUnexpectedEOF)
-					default:
-						pcf.Close()
+					},
+				}
+				actual, loaded := reqs.LoadOrStore(key, sess)
+				if loaded {
+					// another owner won; this fetch's body is not part of any
+					// shared round
+					if reader != nil {
+						_ = reader.Close()
 					}
-				})
-				if err := pcf.AddClient(streamWriter(writer, resp)); err != nil {
-					abortOnCopyError(writer, r, err)
+					closeResponse = false
+				if err := joinPCFClient(actual.(*pcfSession).pcf, w, r, &resp); err != nil {
 					return nil
 				}
-			} else if writer != nil && reader != nil {
-				// response is not collapsible; deliver to this client alone
-				if _, err := tbytes.Copy(streamWriter(writer, resp), reader); err != nil {
-					logger.Error("proxy response copy failed",
-						logging.Pairs{keys.Error: err.Error()})
-					if closeResponse {
-						reader.Close()
-						closeResponse = false
+				} else {
+					pr.mapLock.Lock()
+					writer := PrepareResponseWriter(w, resp.StatusCode, resp.Header, nil)
+					pr.mapLock.Unlock()
+					// Blocks until server completes
+					grClose := reader != nil && closeResponse
+					closeResponse = false
+					goWithRecover("doproxy.pcf.copy", func() {
+						defer func() {
+							if grClose {
+								reader.Close()
+							}
+						}()
+						// identity-guarded so a late pump cannot unregister a
+						// successor round for this key
+						defer reqs.CompareAndDelete(key, sess)
+						n, err := tbytes.Copy(pcf, reader)
+						switch {
+						case err != nil:
+							logger.Error("pcf upstream copy failed",
+								logging.Pairs{keys.Error: err.Error()})
+							pcf.CloseWithError(err)
+						case r.Method != http.MethodHead && contentLength > 0 && n < contentLength:
+							logger.Error("pcf upstream returned short body",
+								logging.Pairs{keys.Key: key})
+							pcf.CloseWithError(io.ErrUnexpectedEOF)
+						default:
+							pcf.Close()
+						}
+					})
+					if err := pcf.AddClientContext(r.Context(), streamWriter(writer, resp)); err != nil {
+						abortOnCopyError(writer, r, err)
+						return nil
 					}
-					abortOnCopyError(writer, r, err)
+				}
+			} else {
+				pr.mapLock.Lock()
+				writer := PrepareResponseWriter(w, resp.StatusCode, resp.Header, nil)
+				pr.mapLock.Unlock()
+				if writer != nil && reader != nil {
+					// response is not collapsible; deliver to this client alone
+					if _, err := tbytes.Copy(streamWriter(writer, resp), reader); err != nil {
+						logger.Error("proxy response copy failed",
+							logging.Pairs{keys.Error: err.Error()})
+						if closeResponse {
+							reader.Close()
+							closeResponse = false
+						}
+						abortOnCopyError(writer, r, err)
+					}
 				}
 			}
 		} else {
-			pcf, _ := result.(ProgressiveCollapseForwarder)
-			resp = pcf.GetResp()
-			pr.mapLock.Lock()
-			writer := PrepareResponseWriter(w, resp.StatusCode, resp.Header, nil)
-			pr.mapLock.Unlock()
-			if err := pcf.AddClient(streamWriter(writer, resp)); err != nil {
-				abortOnCopyError(writer, r, err)
+			pcf := result.(*pcfSession).pcf
+			if err := joinPCFClient(pcf, w, r, &resp); err != nil {
 				return nil
 			}
 		}
